@@ -1,0 +1,19 @@
+# Environments
+venv/
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Deployed-file backups
+server.py.bak-*
+server.py.pre-repo-*
+
+# Working data / generated reports (never source)
+generated_history.*
+recon*.md
+recon*.json
+
+# OS noise
+.DS_Store
