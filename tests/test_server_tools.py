@@ -21,6 +21,7 @@ from unittest import mock
 import httpx
 
 import pco_accounts as pa
+import pco_writes
 import server
 
 
@@ -219,14 +220,33 @@ def ok(payload):
 
 
 class FakeClient:
-    def __init__(self, handler):
+    def __init__(self, handler, writer=None):
         self.handler = handler
+        self.writer = writer
         self.calls: list[tuple[str, dict]] = []
+        self.request_calls: list[dict] = []
 
     def get(self, path, params=None, **kwargs):
         captured = dict(params or {})
         self.calls.append((str(path), captured))
         return self.handler(str(path), captured)
+
+    def request(self, method, path=None, *, url=None, **kwargs):
+        """Record a mutating request; refuse one unless a writer was supplied.
+
+        httpx accepts the target as ``url``; pco_writes passes it positionally.
+        """
+        target = path if path is not None else url
+        if target is None:
+            raise TypeError("FakeClient.request requires a path or url")
+        record = {"method": str(method).upper(), "path": str(target)}
+        record.update(kwargs)
+        self.request_calls.append(record)
+        if self.writer is None:
+            raise AssertionError(
+                f"unexpected mutating request {record['method']} {record['path']}"
+            )
+        return self.writer(record)
 
     def close(self):
         pass
@@ -338,14 +358,15 @@ class ServerTestBase(unittest.TestCase):
         return value
 
     def use_clients(self, mapping):
-        """Patch pco_accounts.get_client plus every server.py alias of it."""
+        """Patch pco_accounts.get_client plus every server/pco_writes alias of it."""
         self.client_map = dict(mapping)
         original = pa.get_client
         fake = self._fake_get_client
         patchers = [mock.patch.object(pa, "get_client", fake)]
-        for name, value in list(vars(server).items()):
-            if value is original:
-                patchers.append(mock.patch.object(server, name, fake))
+        for module in (server, pco_writes):
+            for name, value in list(vars(module).items()):
+                if value is original:
+                    patchers.append(mock.patch.object(module, name, fake))
         for patcher in patchers:
             patcher.start()
             self.addCleanup(patcher.stop)

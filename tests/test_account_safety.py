@@ -1,12 +1,15 @@
-"""Account-safety and read-only invariants for the PCO MCP.
+"""Account-safety and write-isolation invariants for the PCO MCP.
 
-Covers six areas:
-1. AST guard: server.py and pco_accounts.py never call an HTTP write verb.
-2. Tool-surface guard: every pco_* tool is on the reviewed read-only allowlist.
+Covers seven areas:
+1. AST guard: server.py and pco_accounts.py never call an HTTP write verb;
+   pco_writes.py is the sole module with a mutating transport call.
+2. Tool-surface guard: every pco_* tool is on the reviewed allowlist, and the
+   nine write tools expose `account` (no default) plus `confirm=False`.
 3. Alternating account routing under repeated calls cannot leak rows.
 4. Chat selection (pco_use_account) versus explicit account= override.
 5. Concurrent explicit-account reads stay isolated.
 6. account="all" aggregation tags each plan with its own account/org.
+7. Write tools never accept the chat selection or "all" as a target.
 
 No network access: all clients are the fake clients from test_server_tools.
 """
@@ -15,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import inspect
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
@@ -35,16 +39,33 @@ from tests.test_server_tools import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# HTTP verbs that mutate state (or that could tunnel one). Only GET is allowed
-# through the read-only transport.
+# HTTP verbs that mutate state (or that could tunnel one). server.py and
+# pco_accounts.py may only GET; every mutation goes through pco_writes.
 FORBIDDEN_METHOD_NAMES = frozenset({"post", "put", "patch", "delete", "request", "send"})
 FORBIDDEN_QUALIFIED_CALLS = frozenset(
     {"httpx.request", "httpx.Client.request", "httpx.Client.send"}
 )
 
-# Every pco_* tool must be reviewed before it may appear. All entries are reads
-# against PCO; pco_use_account and pco_set_default_account only touch local
-# chat/config state, never the PCO API.
+# The nine audited write tools. Each requires an explicit account (no default,
+# never "all"/the chat selection) and previews unless confirm=True is passed.
+WRITE_TOOL_NAMES = frozenset(
+    {
+        "pco_create_plan",
+        "pco_update_plan",
+        "pco_delete_plan",
+        "pco_create_plan_item",
+        "pco_update_plan_item",
+        "pco_delete_plan_item",
+        "pco_create_plan_time",
+        "pco_update_plan_time",
+        "pco_delete_plan_time",
+    }
+)
+
+# Every pco_* tool must be reviewed before it may appear. Reads are marked
+# below; the pco_*_plan/item/time entries are the audited writes whose only
+# transport is pco_writes.run_write, and pco_use_account /
+# pco_set_default_account only touch local chat/config state.
 ALLOWED_TOOL_NAMES = frozenset(
     {
         "pco_list_accounts",
@@ -59,12 +80,23 @@ ALLOWED_TOOL_NAMES = frozenset(
         "pco_person_song_history",
         "pco_person_upcoming",
     }
-)
+) | WRITE_TOOL_NAMES
 
-# Expected core read surface; a silently empty list_tools() must not pass.
+# Expected surface; a silently empty list_tools() must not pass.
 REQUIRED_TOOL_NAMES = frozenset(
     {"pco_list_service_types", "pco_list_plans", "pco_use_account"}
 )
+
+
+def _tool_parameters(tool: object) -> dict[str, inspect.Parameter]:
+    """Signature parameters of a tool, unwrapping a FastMCP FunctionTool if needed."""
+    target = tool
+    for attr in ("fn", "func", "__wrapped__"):
+        candidate = getattr(target, attr, None)
+        if callable(candidate):
+            target = candidate
+            break
+    return inspect.signature(target).parameters
 
 
 def _dotted_name(node: ast.AST) -> str | None:
@@ -106,8 +138,8 @@ def _find_forbidden_http_calls(source: str, filename: str) -> list[str]:
     return violations
 
 
-class ReadOnlyTransportGuardTests(unittest.TestCase):
-    """The security invariant: this server is read-only by construction."""
+class WriteTransportGuardTests(unittest.TestCase):
+    """The security invariant: pco_writes is the only mutating transport."""
 
     def test_no_http_write_calls_in_server_or_accounts(self):
         violations: list[str] = []
@@ -122,9 +154,79 @@ class ReadOnlyTransportGuardTests(unittest.TestCase):
 
         if violations:
             self.fail(
-                "Read-only PCO transport was broken; every upstream call must be "
-                "a GET through server._get:\n" + "\n".join(violations)
+                "Write isolation was broken; server.py and pco_accounts.py must "
+                "only GET through server._get, and pco_writes.run_write must be "
+                "the sole mutating path:\n" + "\n".join(violations)
             )
+
+    def test_pco_writes_is_the_sole_mutating_transport(self):
+        write_path = REPO_ROOT / "pco_writes.py"
+        self.assertTrue(write_path.is_file(), f"missing source file {write_path}")
+
+        per_file: dict[str, list[str]] = {}
+        for path in sorted(REPO_ROOT.glob("*.py")):
+            violations = _find_forbidden_http_calls(
+                path.read_text(encoding="utf-8"), path.name
+            )
+            if violations:
+                per_file[path.name] = violations
+
+        self.assertEqual(
+            sorted(per_file),
+            ["pco_writes.py"],
+            f"only pco_writes.py may call a mutating HTTP verb: {per_file}",
+        )
+        write_calls = per_file["pco_writes.py"]
+        # A guard that finds nothing here would be vacuous; exactly one
+        # client.request call site is the single audited send path.
+        self.assertEqual(len(write_calls), 1, write_calls)
+        self.assertIn(".request", write_calls[0])
+        self.assertFalse(
+            any(
+                token in write_calls[0]
+                for token in (".post", ".put", ".patch", ".delete", ".send")
+            ),
+            write_calls,
+        )
+
+        source = write_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename="pco_writes.py")
+        request_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "request"
+        ]
+        self.assertEqual(len(request_calls), 1, request_calls)
+        target = request_calls[0]
+        self.assertIsInstance(target.func.value, ast.Name)
+        self.assertEqual(target.func.value.id, "client")
+        self.assertTrue(target.args, target)
+        self.assertIsInstance(target.args[0], ast.Name)
+        self.assertEqual(target.args[0].id, "method")
+        owners = [
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(call is target for call in ast.walk(node))
+        ]
+        self.assertEqual(owners, ["_send_write"], owners)
+
+        ambient_names = {
+            node.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name)
+        } | {
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+        }
+        self.assertEqual(
+            ambient_names & {"selected_account", "installation_default", "_dispatch", "fan_out"},
+            set(),
+            "pco_writes must not consult read-routing or ambient account state",
+        )
 
     def test_guard_detects_synthetic_write_calls(self):
         source = """
@@ -146,24 +248,48 @@ response.json()
         self.assertFalse(any("client.get" in line for line in violations), violations)
 
 
-class ToolSurfaceReadOnlyTests(unittest.TestCase):
-    def test_every_pco_tool_is_on_the_read_only_allowlist(self):
+class ToolSurfaceAllowlistTests(unittest.TestCase):
+    def test_every_pco_tool_is_on_the_reviewed_allowlist(self):
         tools = asyncio.run(server.mcp.list_tools())
         names = {tool.name for tool in tools if tool.name.startswith("pco_")}
 
         self.assertTrue(names, "list_tools() returned no pco_* tools")
         self.assertEqual(
-            sorted(REQUIRED_TOOL_NAMES - names),
+            sorted((REQUIRED_TOOL_NAMES | WRITE_TOOL_NAMES) - names),
             [],
-            f"core read tools disappeared from the surface: {sorted(names)}",
+            f"core read or write tools disappeared from the surface: {sorted(names)}",
         )
         unexpected = sorted(names - ALLOWED_TOOL_NAMES)
         self.assertEqual(
             unexpected,
             [],
-            "New pco_* tool(s) need a read-only review before joining the "
+            "New pco_* tool(s) need a review before joining the "
             f"allowlist: {unexpected}",
         )
+
+    def test_write_tools_require_account_without_a_default(self):
+        for name in sorted(WRITE_TOOL_NAMES):
+            with self.subTest(tool=name):
+                tool = getattr(server, name, None)
+                self.assertIsNotNone(tool, f"missing write tool {name}")
+                params = _tool_parameters(tool)
+                self.assertIn("account", params, f"{name} must take account")
+                self.assertIs(
+                    params["account"].default,
+                    inspect.Parameter.empty,
+                    f"{name} must require an explicit account (no default)",
+                )
+
+    def test_write_tools_default_to_preview(self):
+        for name in sorted(WRITE_TOOL_NAMES):
+            with self.subTest(tool=name):
+                params = _tool_parameters(getattr(server, name))
+                self.assertIn("confirm", params, f"{name} must take confirm")
+                self.assertIs(
+                    params["confirm"].default,
+                    False,
+                    f"{name} must default confirm=False (preview)",
+                )
 
 
 STRESS_ORGS = {

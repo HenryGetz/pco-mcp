@@ -1,17 +1,19 @@
 # pco-mcp
 
-A [FastMCP](https://github.com/jlowin/fastmcp) stdio server for the **Planning Center Online Services API v2**. It exposes eleven tools for reading service types, plans, setlists, songs, arrangements, a person's song history and upcoming assignments across one or many Planning Center organizations, and is registered with [omp](https://github.com/ompfine/omp) as `pco`. Account routing is per chat: each chat can pick its own account without disturbing any other chat.
+A [FastMCP](https://github.com/jlowin/fastmcp) stdio server for the **Planning Center Online Services API v2**. It exposes twenty tools: eleven existing read and account tools for service types, plans, setlists, songs, arrangements, a person's song history and upcoming assignments, plus nine controlled-write tools for plans, plan items, and plan times, across one or many Planning Center organizations. It is registered with [omp](https://github.com/ompfine/omp) as `pco`. Read routing is per chat: each chat can pick its own account without disturbing any other chat.
 
-Read-only: every tool issues `GET` against `https://api.planningcenteronline.com/services/v2`; there are no create, update, or delete tools. Nothing is written back to Planning Center. See [Read-only safety](#read-only-safety).
+Reads are `GET`-only. Writes are preview-by-default, explicit-account-only, and never retried automatically: `confirm=False` returns the exact payload and writes nothing; `confirm=True` sends one `POST`/`PATCH`/`DELETE`. See [Write safety](#write-safety).
 
 ## Accounts
 
 Account credentials live in `~/.mpco_credentials.json` as one JSON object per account.
-Every tool that reads Planning Center data takes `account`:
+Read tools take `account`:
 
 - **Omitted** — this chat's selected account if one was set with `pco_use_account`, otherwise the installation default snapshot.
 - **A name** — that account only, and it always wins over any chat selection. An unknown name raises; there is no silent fallback to the first account.
 - **`"all"`** — fan out over every configured account, sequentially; ignores any chat selection.
+
+Write tools do **not** use this resolution. `account` is required and must be a concrete configured name on every write call; `account="all"`, an omitted account, the chat selection, and the installation default are all rejected for writes, with no fallback. See [Write tools](#write-tools).
 
 ### Installation default precedence
 
@@ -44,7 +46,7 @@ resolves. It never writes `~/.mpco_config.json` or the credentials file. If a cu
 client multiplexes several chats through one `lazy-tool` process, they share that
 process's scope; pass explicit `account=` when hard isolation matters.
 
-Precedence for every tool call, highest first:
+Precedence for read tool calls, highest first:
 
 | Priority | Source | Set by |
 |---|---|---|
@@ -53,6 +55,10 @@ Precedence for every tool call, highest first:
 | 3 | `installation` — the default snapshot above | env / `~/.mpco_config.json` / credentials order |
 
 `account="all"` bypasses this and fans out over `list_accounts()`.
+
+Writes never consult priorities 2 or 3 and never accept `"all"`: the `account=` argument
+must name one concrete account, so a chat selected for one organization cannot redirect
+a write to it.
 
 Built-in tools:
 
@@ -84,7 +90,8 @@ Built-in tools:
 Every single-account result also carries `account_source` (`"explicit"`, `"chat"`, or
 `"installation"`) so you can see which rule selected the account. A fan-out envelope
 carries `"account_source": "all"` at the top level, and each envelope row keeps its own
-`account` / `org_name` tags.
+`account` / `org_name` tags. Write results and previews always carry
+`account_source: "explicit"`.
 
 If the selected account disappears (for example credentials were edited), calls that
 would use it raise an `AccountError` telling you to call `pco_use_account`; there is no
@@ -139,10 +146,13 @@ name. Both `orgName` and `org_name` are accepted on read; the server writes came
 
 ## Tools
 
-Eleven tools. Every tool with an `account` parameter resolves it the same way: omitted
-uses this chat's `pco_use_account` selection, else the installation default snapshot;
-a name always wins over the chat selection; `"all"` fans out over every configured
-account and ignores the selection. Results carry `account_source`.
+Twenty tools: eleven existing read and account tools and nine write tools. Read tools
+resolve `account` as described under [Accounts](#accounts): omitted uses this chat's
+`pco_use_account` selection, else the installation default snapshot; a name wins over
+the chat selection; `"all"` fans out over every configured account and ignores the
+selection. Results carry `account_source`. Write tools instead require a concrete
+`account=` and ignore both the chat selection and the installation default; see
+[Write tools](#write-tools).
 
 ### `pco_list_accounts(detailed=False) -> list`
 Account names configured in `~/.mpco_credentials.json`. When no credentials file
@@ -204,7 +214,7 @@ omitted. `filter` is `"future"`, `"past"`, or `"all"`. Returns `id`, `service_ty
 plus `account` and `org_name` tags.
 
 ### `pco_get_plan(plan_id_or_url, account=None, include_attachments=True) -> dict`
-Full plan by numeric ID or by pasted Planning Center URL. Locates the owning service type, then returns plan metadata plus `items` sorted by `sequence`. Song items carry `song_id`, `song_title`, `author`, `ccli_number`, `arrangement_id`, `arrangement_name`, `key`, `bpm`, `meter`, `arrangement_notes`; set `include_attachments=False` to skip the per-song arrangement attachment lookups (this is the expensive part — one request per song item). Every item is tagged with `account` and `org_name`; the top level carries both too.
+Full plan by numeric ID or by pasted Planning Center URL. Locates the owning service type, then returns plan metadata plus `items` sorted by `sequence`. Every item includes its numeric `id` for the plan-item write tools. Song items carry `song_id`, `song_title`, `author`, `ccli_number`, `arrangement_id`, `arrangement_name`, `key`, `bpm`, `meter`, `arrangement_notes`; set `include_attachments=False` to skip the per-song arrangement attachment lookups (this is the expensive part — one request per song item). Every item is tagged with `account` and `org_name`; the top level carries both too.
 
 `plan_times` lists the plan's times sorted by `starts_at` with `id`, `name`, `time_type` (`service`/`rehearsal`/`other`), `starts_at`, and `ends_at`. `counts` exposes `service_time_count`, `rehearsal_time_count`, `other_time_count`, `plan_people_count`, `items_count`, `total_length`, and `multi_day`. A non-200 plan-times response leaves `plan_times` empty and adds `plan_times_error`; the plan itself still returns.
 
@@ -323,20 +333,157 @@ A failing account is listed in `errors`; every other account's plans remain in
 `results` and in the merged `plans`, so partial failure keeps the successes. If every
 account fails, the call raises like other fan-out tools. This tool only reads.
 
-## Read-only safety
+## Write tools
 
-All eleven tools are read-only against Planning Center. The server exposes no mutation
-tools, and every upstream request is an HTTP `GET`; there is no create, update, or
-delete path. Account selection changes only *which* organization is read: a selected
-account cannot cause a wrong-account write because no write exists.
+Nine tools create, update, and delete plans, plan items, and plan times. All of them
+share one gate:
 
-An AST-based regression test in `tests/` fails if `post`, `put`, `patch`, `delete`,
-`request`, or `send` appears in `server.py` or `pco_accounts.py`, so the invariant is
-enforced by the test suite rather than by convention.
+- **A concrete account is mandatory.** `account` has no default and must name a
+  configured account. `account="all"`, an empty account, the `pco_use_account` chat
+  selection, and the installation default are all rejected for writes; there is no
+  fallback. Every write response carries `account`, `org_name`, and
+  `account_source: "explicit"`. In a legacy env-only setup the only configured write
+  name is the synthetic `env` account; read-side aliases such as `unw` are not
+  accepted as write targets.
+- **Blank optional strings are omitted, not cleared.** A blank
+  `series_title`/`description`/`name` is treated as not supplied; there is no
+  clear-field sentinel.
+- **Preview by default.** `confirm=False` (the default) runs read-only preflight `GET`s,
+  then returns the exact planned request and writes nothing: `mode: "preview"`,
+  `would_write: false`, `confirm_required: true`, `account`, `org_name`,
+  `account_source: "explicit"`, `operation`, `method`, `path`, `payload`, `preflight`
+  (the current target summary), and a `message`.
+- **Confirm mutates once.** `confirm=True` preflights again and sends exactly one
+  `POST`/`PATCH`/`DELETE`. Success returns `mode: "write"`, `written: true`, `account`,
+  `org_name`, `account_source: "explicit"`, `operation`, `method`, `path`,
+  `status_code`, `request_id` (PCO's `x-request-id` or `x-pco-api-request-id` when
+  present), `resource` (response `data`, or `null`), `deleted` (`true` for a
+  `DELETE`/204), and `message`.
+- **Guards are checked before mutating.** `pco_delete_plan` requires `expected_title`,
+  `expected_sort_date`, or both — plan titles can be `null`, so `expected_sort_date`
+  alone is valid. `expected_sort_date` is normally the plan's date-only
+  `YYYY-MM-DD` value; a full ISO-8601 instant is also accepted and compared as an
+  instant. `pco_delete_plan_item` requires `expected_title`;
+  `pco_delete_plan_time` requires `expected_starts_at`. Each supplied value must match
+  exactly; a mismatch raises before any write. Updates accept optional
+  `expected_title`/`expected_sort_date` (plans), `expected_title` (plan items), or
+  `expected_starts_at` (plan times) guards.
+- **No automatic retry.** `429`, `5xx`, timeouts, and other transport errors are never
+  retried, and a `POST` is never replayed. A `429` is retryable by the caller: wait,
+  then re-preview. `5xx` and transport failures (including timeouts) set
+  `outcome_unknown: true`: the write may have landed, so check the plan in Planning
+  Center before retrying. Other `4xx` responses raise `WriteError` with PCO's status
+  and detail; `403` calls out that the token lacks write permission.
+- **Inputs are strict.** IDs are numeric PCO ids (no URLs or path fragments).
+  Timestamps are ISO-8601 with an explicit timezone, and `ends_at` must be later than
+  `starts_at`. `time_type` is `service`, `rehearsal`, or `other`; `service_position` is
+  `pre`, `during`, or `post`. Updates require at least one attribute to change.
+
+### Plans
+
+- `pco_create_plan(account, service_type_id, title, public=False, series_title=None, series_id=None, confirm=False)`
+  preflights the service type, then creates the plan. `title` is required; `public`
+  controls public visibility.
+- `pco_update_plan(account, service_type_id, plan_id, title=None, public=None, series_title=None, series_id=None, reminders_disabled=None, expected_title=None, expected_sort_date=None, confirm=False)`
+  patches only the supplied attributes. `expected_title`/`expected_sort_date` are
+  optional exact-match guards.
+- `pco_delete_plan(account, service_type_id, plan_id, expected_title=None, expected_sort_date=None, confirm=False)`
+  deletes a plan. At least one exact guard is required; both are compared when both are
+  supplied.
+
+### Plan items
+
+- `pco_create_plan_item(account, service_type_id, plan_id, title, item_type="item", song_id=None, arrangement_id=None, key_id=None, length=None, description=None, service_position="during", sequence=None, confirm=False)`
+  creates an item. `item_type` is `item`, `header`, or `song`; a `song_id` with
+  `item_type="item"` (the default) is treated as a song. A header is sent with
+  `item_type="header"`; regular items and songs omit `item_type`. A song requires
+  `song_id`, and `arrangement_id`/`key_id` are only valid with it.
+- `pco_update_plan_item(account, service_type_id, plan_id, item_id, title=None, description=None, length=None, service_position=None, sequence=None, expected_title=None, confirm=False)`
+  patches at least one attribute; `expected_title` is an optional exact guard.
+- `pco_delete_plan_item(account, service_type_id, plan_id, item_id, expected_title, confirm=False)`
+  requires an exact `expected_title`.
+
+### Plan times
+
+- `pco_create_plan_time(account, service_type_id, plan_id, starts_at, ends_at, time_type="service", name=None, team_reminders=None, confirm=False)`
+  creates a plan time from timezone-bearing ISO timestamps. `team_reminders` maps
+  numeric team ids to integers `0`–`7`.
+- `pco_update_plan_time(account, service_type_id, plan_id, plan_time_id, starts_at=None, ends_at=None, time_type=None, name=None, team_reminders=None, expected_starts_at=None, confirm=False)`
+  patches at least one attribute; `expected_starts_at` is an optional exact instant
+  guard.
+- `pco_delete_plan_time(account, service_type_id, plan_id, plan_time_id, expected_starts_at, confirm=False)`
+  requires an exact `expected_starts_at`.
+
+### Preview, then confirm
+
+A preview is not a token and is not replayed: the `confirm=True` call preflights again
+and sends the current values, so run the same call twice.
+
+```python
+# Plan: preview, then confirm.
+pco_create_plan(account="rs", service_type_id="123456", title="Christmas Eve")
+# -> {"mode": "preview", "would_write": false, "confirm_required": true,
+#     "method": "POST", "path": "/service_types/123456/plans",
+#     "payload": {"data": {"type": "Plan", "attributes": {...}}}, "preflight": {...}}
+created = pco_create_plan(account="rs", service_type_id="123456",
+                          title="Christmas Eve", confirm=True)
+plan_id = created["resource"]["id"]
+
+# Item: preview, then confirm.
+pco_create_plan_item(account="rs", service_type_id="123456", plan_id=plan_id,
+                     title="Great Are You Lord", song_id="654321", key_id="1")
+pco_create_plan_item(account="rs", service_type_id="123456", plan_id=plan_id,
+                     title="Great Are You Lord", song_id="654321", key_id="1",
+                     confirm=True)
+
+# Plan time: preview, then confirm.
+pco_create_plan_time(account="rs", service_type_id="123456", plan_id=plan_id,
+                     starts_at="2026-12-24T22:00:00Z", ends_at="2026-12-24T23:30:00Z")
+pco_create_plan_time(account="rs", service_type_id="123456", plan_id=plan_id,
+                     starts_at="2026-12-24T22:00:00Z", ends_at="2026-12-24T23:30:00Z",
+                     confirm=True)
+
+# Delete: exact guard in the preview, and again with confirm=True.
+pco_delete_plan(account="rs", service_type_id="123456", plan_id=plan_id,
+                expected_sort_date="2026-12-24")
+pco_delete_plan(account="rs", service_type_id="123456", plan_id=plan_id,
+                expected_sort_date="2026-12-24", confirm=True)
+```
+
+## Write safety
+
+Writes are isolated by construction:
+
+- `pco_writes.py` is the only module allowed to issue a mutating HTTP verb (`POST`,
+  `PATCH`, `DELETE`). `server.py` and `pco_accounts.py` stay free of
+  `post`/`put`/`patch`/`delete`/`request`/`send`; AST-based tests enforce both facts.
+- Write paths are allowlisted, with numeric ids only:
+
+  ```
+  POST   /service_types/{st}/plans
+  PATCH  /service_types/{st}/plans/{plan}
+  DELETE /service_types/{st}/plans/{plan}
+  POST   /service_types/{st}/plans/{plan}/items
+  PATCH  /service_types/{st}/plans/{plan}/items/{item}
+  DELETE /service_types/{st}/plans/{plan}/items/{item}
+  POST   /service_types/{st}/plans/{plan}/plan_times
+  PATCH  /service_types/{st}/plan_times/{time}
+  DELETE /service_types/{st}/plan_times/{time}
+  ```
+
+- The write target comes only from the explicit `account=` argument. Chat selection and
+  the installation default are never consulted, and `"all"` is rejected, so a chat set
+  to one organization cannot redirect a write to it. Preflight reads use the same
+  explicit account and fail closed on `403`/`404`, naming that account.
+- `confirm=False` is always safe: it returns the exact planned request and performs no
+  mutation. `confirm=True` performs one request with no retry, so a write cannot be
+  silently duplicated.
+- Results are tagged per organization (`account`, `org_name`,
+  `account_source: "explicit"`), including previews.
 
 ## Setup
 
-Requirements: Python 3.12+, a Planning Center account with a **Personal Access Token** (appId + secret).
+Requirements: Python 3.12+, a Planning Center account with a **Personal Access Token** (appId + secret). The token needs **write permission** if you intend to use the write tools; a read-only token still previews fine but any `confirm=True` call fails with `403`.
 
 ```bash
 git clone <repo-url> ~/ai/pco-mcp

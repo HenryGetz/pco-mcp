@@ -4,7 +4,7 @@
 Integrates with Planning Center Services API (v2) using credentials from
 ~/.mpco_credentials.json or environment variables.
 
-Every tool that talks to PCO takes ``account``. Routing precedence per call:
+Read tools take ``account`` and resolve it per call:
 
 1. explicit ``account=`` (a name, or ``"all"``) always wins;
 2. this chat's selection (``pco_use_account``), keyed to the stable lazy-tool
@@ -12,8 +12,14 @@ Every tool that talks to PCO takes ``account``. Routing precedence per call:
 3. the installation default snapshot (env/config/first key), cached per process.
 
 ``"all"`` fans out over every configured account. Selections never cross chats;
-``pco_set_default_account(..., persist=True)`` is the only call that writes the
-config file, and it affects new chats only.
+``pco_set_default_account(..., persist=True)`` is the only read-side call that
+writes the config file, and it affects new chats only.
+
+Write tools are different: the account must be an explicit, concrete account
+name. ``"all"``, omitted accounts, the chat selection, and the installation
+default are rejected. Every write is preview-only until ``confirm=True`` and is
+sent exactly once (no automatic retries). All mutating HTTP lives in
+``pco_writes.py``.
 """
 
 from __future__ import annotations
@@ -24,7 +30,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Callable, Optional
 
 import httpx
@@ -51,6 +57,23 @@ from pco_accounts import (
     select_account,
     selected_account,
     set_default_account,
+)
+from pco_writes import (
+    check_expected_date,
+    check_expected_text,
+    check_expected_time,
+    clean_bool,
+    clean_int,
+    clean_iso,
+    clean_service_position,
+    clean_team_reminders,
+    clean_text,
+    clean_time_type,
+    preflight_list,
+    preflight_object,
+    require_id,
+    run_write,
+    write_context,
 )
 
 mcp = FastMCP("planning-center")
@@ -469,6 +492,7 @@ def _get_plan_single(
         description = i_attrs.get("description")
 
         item_dict: dict[str, Any] = {
+            "id": item.get("id"),
             "sequence": sequence,
             "title": title,
             "type": item_type,
@@ -1462,6 +1486,638 @@ def pco_person_upcoming(
             },
         })
     return result
+
+
+# ---------------------------------------------------------------------------
+# Writes: explicit account only, preview unless confirm=True
+# ---------------------------------------------------------------------------
+#
+# Every mutating HTTP call lives in pco_writes.run_write. These tools validate
+# input, preflight the target under the same explicit account, and never consult
+# pco_use_account, the installation default, or account="all".
+
+
+def _write_attrs(obj: Any) -> dict[str, Any]:
+    """Attributes of a preflight resource; accepts a flat row or JSON:API envelope."""
+    if not isinstance(obj, dict):
+        return {}
+    data = obj.get("data") if isinstance(obj.get("data"), dict) else obj
+    attrs = data.get("attributes") if isinstance(data, dict) else None
+    if isinstance(attrs, dict):
+        return attrs
+    # Also accept a flattened {id, **attributes} mapping for compatibility with
+    # preflight helpers that merge attributes over the resource id.
+    if isinstance(data, dict):
+        return {
+            key: value
+            for key, value in data.items()
+            if key not in ("id", "type", "relationships", "links")
+        }
+    return {}
+
+
+def _parse_instant(value: str) -> datetime:
+    """Parse an ISO-8601 instant that clean_iso already validated."""
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    return datetime.fromisoformat(text)
+
+
+def _plan_summary(
+    service_type_id: str,
+    plan_id: str,
+    attrs: dict[str, Any],
+    account: str,
+    org: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    return {
+        "resource": "plan",
+        "service_type_id": service_type_id,
+        "id": plan_id,
+        "title": attrs.get("title"),
+        "sort_date": attrs.get("sort_date"),
+        **extra,
+        "account": account,
+        "org_name": org,
+    }
+
+
+def _item_summary(
+    service_type_id: str,
+    plan_id: str,
+    item_id: str,
+    attrs: dict[str, Any],
+    account: str,
+    org: str,
+) -> dict[str, Any]:
+    return {
+        "resource": "item",
+        "service_type_id": service_type_id,
+        "plan_id": plan_id,
+        "id": item_id,
+        "title": attrs.get("title"),
+        "item_type": attrs.get("item_type"),
+        "sequence": attrs.get("sequence"),
+        "account": account,
+        "org_name": org,
+    }
+
+
+def _plan_time_summary(
+    service_type_id: str,
+    plan_id: str,
+    plan_time_id: str,
+    attrs: dict[str, Any],
+    account: str,
+    org: str,
+) -> dict[str, Any]:
+    return {
+        "resource": "plan_time",
+        "service_type_id": service_type_id,
+        "plan_id": plan_id,
+        "id": plan_time_id,
+        "name": attrs.get("name"),
+        "time_type": attrs.get("time_type"),
+        "starts_at": attrs.get("starts_at"),
+        "ends_at": attrs.get("ends_at"),
+        "account": account,
+        "org_name": org,
+    }
+
+
+def _find_plan_time(rows: list[dict[str, Any]], plan_time_id: str) -> Optional[dict[str, Any]]:
+    for row in rows:
+        if str(row.get("id")) == plan_time_id:
+            return row
+    return None
+
+
+@mcp.tool()
+def pco_create_plan(
+    account: str,
+    service_type_id: str,
+    title: str,
+    public: bool = False,
+    series_title: Optional[str] = None,
+    series_id: Optional[str] = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Create a plan under a service type.
+
+    Writes require an explicit `account`; "all" and this chat's selection are
+    rejected, never used as a fallback. confirm=False (default) returns the exact
+    payload and preflight without writing; pass confirm=True to send it. The
+    request is never retried, so a failed write must be inspected before retrying.
+    """
+    account, org = write_context(account)
+    st_id = require_id(service_type_id, "service_type_id")
+    attrs: dict[str, Any] = {
+        "title": clean_text(title, "title"),
+        "public": clean_bool(public, "public"),
+    }
+    if series_title is not None:
+        cleaned_series = clean_text(series_title, "series_title", required=False)
+        if cleaned_series is not None:
+            attrs["series_title"] = cleaned_series
+    if series_id is not None:
+        attrs["series_id"] = require_id(series_id, "series_id")
+
+    st_attrs = _write_attrs(preflight_object(account, f"/service_types/{st_id}"))
+
+    return run_write(
+        account=account,
+        operation="create_plan",
+        method="POST",
+        path=f"/service_types/{st_id}/plans",
+        resource_type="Plan",
+        resource_id=None,
+        attributes=attrs,
+        preflight={
+            "resource": "service_type",
+            "id": st_id,
+            "name": st_attrs.get("name"),
+            "account": account,
+            "org_name": org,
+        },
+        confirm=confirm,
+    )
+
+
+@mcp.tool()
+def pco_update_plan(
+    account: str,
+    service_type_id: str,
+    plan_id: str,
+    title: Optional[str] = None,
+    public: Optional[bool] = None,
+    series_title: Optional[str] = None,
+    series_id: Optional[str] = None,
+    reminders_disabled: Optional[bool] = None,
+    expected_title: Optional[str] = None,
+    expected_sort_date: Optional[str] = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Update plan fields; at least one attribute is required.
+
+    Writes require an explicit `account`; "all" and this chat's selection are
+    rejected. expected_title/expected_sort_date, when given, must match the
+    current plan exactly before anything is sent. confirm=False (default)
+    previews; confirm=True sends one request. Never retried.
+    """
+    account, org = write_context(account)
+    st_id = require_id(service_type_id, "service_type_id")
+    plan = require_id(plan_id, "plan_id")
+    attrs: dict[str, Any] = {}
+    if title is not None:
+        attrs["title"] = clean_text(title, "title")
+    if public is not None:
+        attrs["public"] = clean_bool(public, "public")
+    if series_title is not None:
+        cleaned_series = clean_text(series_title, "series_title", required=False)
+        if cleaned_series is not None:
+            attrs["series_title"] = cleaned_series
+    if series_id is not None:
+        attrs["series_id"] = require_id(series_id, "series_id")
+    if reminders_disabled is not None:
+        attrs["reminders_disabled"] = clean_bool(reminders_disabled, "reminders_disabled")
+    if not attrs:
+        raise ValueError("Provide at least one plan attribute to update")
+
+    plan_attrs = _write_attrs(preflight_object(account, f"/service_types/{st_id}/plans/{plan}"))
+    guard = clean_text(expected_title, "expected_title", required=False) if expected_title is not None else None
+    if guard is not None:
+        check_expected_text(plan_attrs.get("title"), guard, "plan title")
+    if expected_sort_date is not None:
+        check_expected_date(
+            plan_attrs.get("sort_date"),
+            expected_sort_date,
+            "plan sort_date",
+        )
+
+    return run_write(
+        account=account,
+        operation="update_plan",
+        method="PATCH",
+        path=f"/service_types/{st_id}/plans/{plan}",
+        resource_type="Plan",
+        resource_id=plan,
+        attributes=attrs,
+        preflight=_plan_summary(st_id, plan, plan_attrs, account, org),
+        confirm=confirm,
+    )
+
+
+@mcp.tool()
+def pco_delete_plan(
+    account: str,
+    service_type_id: str,
+    plan_id: str,
+    expected_title: Optional[str] = None,
+    expected_sort_date: Optional[str] = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Delete a plan; requires an exact title or sort_date guard.
+
+    Pass expected_title or expected_sort_date (at least one). Every guard supplied
+    must match the current plan exactly before anything is sent; sort_date works
+    alone for plans with a null title. Writes require an explicit `account`;
+    "all" and this chat's selection are rejected. confirm=False (default)
+    previews; confirm=True sends one request. Never retried.
+    """
+    account, org = write_context(account)
+    st_id = require_id(service_type_id, "service_type_id")
+    plan = require_id(plan_id, "plan_id")
+    title_guard = clean_text(expected_title, "expected_title", required=False) if expected_title is not None else None
+    date_guard = clean_text(expected_sort_date, "expected_sort_date", required=False) if expected_sort_date is not None else None
+    if title_guard is None and date_guard is None:
+        raise ValueError("Pass expected_title or expected_sort_date so the delete is verified")
+
+    plan_attrs = _write_attrs(preflight_object(account, f"/service_types/{st_id}/plans/{plan}"))
+    if title_guard is not None:
+        check_expected_text(plan_attrs.get("title"), title_guard, "plan title")
+    if date_guard is not None:
+        check_expected_date(plan_attrs.get("sort_date"), date_guard, "plan sort_date")
+
+    return run_write(
+        account=account,
+        operation="delete_plan",
+        method="DELETE",
+        path=f"/service_types/{st_id}/plans/{plan}",
+        resource_type="Plan",
+        resource_id=plan,
+        attributes=None,
+        preflight=_plan_summary(st_id, plan, plan_attrs, account, org),
+        confirm=confirm,
+    )
+
+
+@mcp.tool()
+def pco_create_plan_item(
+    account: str,
+    service_type_id: str,
+    plan_id: str,
+    title: str,
+    item_type: str = "item",
+    song_id: Optional[str] = None,
+    arrangement_id: Optional[str] = None,
+    key_id: Optional[str] = None,
+    length: Optional[int] = None,
+    description: Optional[str] = None,
+    service_position: str = "during",
+    sequence: Optional[int] = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Create an item (item, header, or song) on a plan.
+
+    item_type is item|header|song; a song_id with item_type="item" is treated as
+    a song. song requires song_id; arrangement_id/key_id require song_id. A song
+    preflights /songs/{song_id} under the same account. Writes require an explicit
+    `account`; "all" and this chat's selection are rejected. confirm=False
+    (default) previews; confirm=True sends one request. Never retried.
+    """
+    account, org = write_context(account)
+    st_id = require_id(service_type_id, "service_type_id")
+    plan = require_id(plan_id, "plan_id")
+    kind = (item_type or "").strip().lower()
+    if kind not in ("item", "header", "song"):
+        raise ValueError("item_type must be 'item', 'header', or 'song'")
+    song = require_id(song_id, "song_id") if song_id is not None else None
+    if kind == "item" and song is not None:
+        kind = "song"
+    if kind == "song" and song is None:
+        raise ValueError("song_id is required when item_type='song'")
+    if kind == "header" and song is not None:
+        raise ValueError("header items cannot include song_id")
+    if song is None and (arrangement_id is not None or key_id is not None):
+        raise ValueError("arrangement_id and key_id require song_id")
+    arrangement = require_id(arrangement_id, "arrangement_id") if arrangement_id is not None else None
+    key = require_id(key_id, "key_id") if key_id is not None else None
+
+    attrs: dict[str, Any] = {
+        "title": clean_text(title, "title"),
+        "service_position": clean_service_position(service_position),
+    }
+    if kind == "header":
+        attrs["item_type"] = "header"
+    if song is not None:
+        attrs["song_id"] = song
+        if arrangement is not None:
+            attrs["arrangement_id"] = arrangement
+        if key is not None:
+            attrs["key_id"] = key
+    if length is not None:
+        attrs["length"] = clean_int(length, "length", minimum=0, optional=True)
+    if description is not None:
+        cleaned_description = clean_text(description, "description", required=False)
+        if cleaned_description is not None:
+            attrs["description"] = cleaned_description
+    if sequence is not None:
+        attrs["sequence"] = clean_int(sequence, "sequence", minimum=0, optional=True)
+
+    plan_attrs = _write_attrs(preflight_object(account, f"/service_types/{st_id}/plans/{plan}"))
+    extra: dict[str, Any] = {"item_type": kind, "song_id": song}
+    if song is not None:
+        song_attrs = _write_attrs(preflight_object(account, f"/songs/{song}"))
+        extra["song_title"] = song_attrs.get("title")
+
+    return run_write(
+        account=account,
+        operation="create_plan_item",
+        method="POST",
+        path=f"/service_types/{st_id}/plans/{plan}/items",
+        resource_type="Item",
+        resource_id=None,
+        attributes=attrs,
+        preflight=_plan_summary(st_id, plan, plan_attrs, account, org, **extra),
+        confirm=confirm,
+    )
+
+
+@mcp.tool()
+def pco_update_plan_item(
+    account: str,
+    service_type_id: str,
+    plan_id: str,
+    item_id: str,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    length: Optional[int] = None,
+    service_position: Optional[str] = None,
+    sequence: Optional[int] = None,
+    expected_title: Optional[str] = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Update plan item fields; at least one attribute is required.
+
+    expected_title, when given, must match the current item title exactly before
+    anything is sent. Writes require an explicit `account`; "all" and this chat's
+    selection are rejected. confirm=False (default) previews; confirm=True sends
+    one request. Never retried.
+    """
+    account, org = write_context(account)
+    st_id = require_id(service_type_id, "service_type_id")
+    plan = require_id(plan_id, "plan_id")
+    item = require_id(item_id, "item_id")
+    attrs: dict[str, Any] = {}
+    if title is not None:
+        attrs["title"] = clean_text(title, "title")
+    if description is not None:
+        cleaned_description = clean_text(description, "description", required=False)
+        if cleaned_description is not None:
+            attrs["description"] = cleaned_description
+    if length is not None:
+        attrs["length"] = clean_int(length, "length", minimum=0, optional=True)
+    if service_position is not None:
+        attrs["service_position"] = clean_service_position(service_position)
+    if sequence is not None:
+        attrs["sequence"] = clean_int(sequence, "sequence", minimum=0, optional=True)
+    if not attrs:
+        raise ValueError("Provide at least one item attribute to update")
+
+    item_attrs = _write_attrs(
+        preflight_object(account, f"/service_types/{st_id}/plans/{plan}/items/{item}")
+    )
+    guard = clean_text(expected_title, "expected_title", required=False) if expected_title is not None else None
+    if guard is not None:
+        check_expected_text(item_attrs.get("title"), guard, "item title")
+
+    return run_write(
+        account=account,
+        operation="update_plan_item",
+        method="PATCH",
+        path=f"/service_types/{st_id}/plans/{plan}/items/{item}",
+        resource_type="Item",
+        resource_id=item,
+        attributes=attrs,
+        preflight=_item_summary(st_id, plan, item, item_attrs, account, org),
+        confirm=confirm,
+    )
+
+
+@mcp.tool()
+def pco_delete_plan_item(
+    account: str,
+    service_type_id: str,
+    plan_id: str,
+    item_id: str,
+    expected_title: str,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Delete a plan item after an exact current-title check.
+
+    Writes require an explicit `account`; "all" and this chat's selection are
+    rejected. confirm=False (default) previews; confirm=True sends one request.
+    Never retried.
+    """
+    account, org = write_context(account)
+    st_id = require_id(service_type_id, "service_type_id")
+    plan = require_id(plan_id, "plan_id")
+    item = require_id(item_id, "item_id")
+    guard = clean_text(expected_title, "expected_title")
+
+    item_attrs = _write_attrs(
+        preflight_object(account, f"/service_types/{st_id}/plans/{plan}/items/{item}")
+    )
+    check_expected_text(item_attrs.get("title"), guard, "item title")
+
+    return run_write(
+        account=account,
+        operation="delete_plan_item",
+        method="DELETE",
+        path=f"/service_types/{st_id}/plans/{plan}/items/{item}",
+        resource_type="Item",
+        resource_id=item,
+        attributes=None,
+        preflight=_item_summary(st_id, plan, item, item_attrs, account, org),
+        confirm=confirm,
+    )
+
+
+@mcp.tool()
+def pco_create_plan_time(
+    account: str,
+    service_type_id: str,
+    plan_id: str,
+    starts_at: str,
+    ends_at: str,
+    time_type: str = "service",
+    name: Optional[str] = None,
+    team_reminders: Optional[dict[str, int]] = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Create a plan time (service, rehearsal, or other) on a plan.
+
+    starts_at/ends_at must be ISO-8601 with an explicit timezone, and ends_at must
+    be after starts_at. time_type is service|rehearsal|other; team_reminders maps
+    numeric team ids to 0..7. Writes require an explicit `account`; "all" and this
+    chat's selection are rejected. confirm=False (default) previews; confirm=True
+    sends one request. Never retried.
+    """
+    account, org = write_context(account)
+    st_id = require_id(service_type_id, "service_type_id")
+    plan = require_id(plan_id, "plan_id")
+    start = clean_iso(starts_at, "starts_at", required=True)
+    end = clean_iso(ends_at, "ends_at", required=True)
+    if _parse_instant(end) <= _parse_instant(start):
+        raise ValueError("ends_at must be after starts_at")
+    attrs: dict[str, Any] = {
+        "starts_at": start,
+        "ends_at": end,
+        "time_type": clean_time_type(time_type),
+    }
+    if name is not None:
+        cleaned_name = clean_text(name, "name", required=False)
+        if cleaned_name is not None:
+            attrs["name"] = cleaned_name
+    if team_reminders is not None:
+        attrs["team_reminders"] = clean_team_reminders(team_reminders)
+
+    plan_attrs = _write_attrs(preflight_object(account, f"/service_types/{st_id}/plans/{plan}"))
+
+    return run_write(
+        account=account,
+        operation="create_plan_time",
+        method="POST",
+        path=f"/service_types/{st_id}/plans/{plan}/plan_times",
+        resource_type="PlanTime",
+        resource_id=None,
+        attributes=attrs,
+        preflight=_plan_summary(
+            st_id, plan, plan_attrs, account, org, starts_at=start, ends_at=end
+        ),
+        confirm=confirm,
+    )
+
+
+@mcp.tool()
+def pco_update_plan_time(
+    account: str,
+    service_type_id: str,
+    plan_id: str,
+    plan_time_id: str,
+    starts_at: Optional[str] = None,
+    ends_at: Optional[str] = None,
+    time_type: Optional[str] = None,
+    name: Optional[str] = None,
+    team_reminders: Optional[dict[str, int]] = None,
+    expected_starts_at: Optional[str] = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Update a plan time; at least one attribute is required.
+
+    The plan-time collection is preflighted under the same account and the id
+    must exist. expected_starts_at, when given, must match the current instant
+    exactly before anything is sent. Writes require an explicit `account`; "all"
+    and this chat's selection are rejected. confirm=False (default) previews;
+    confirm=True sends one request. Never retried.
+    """
+    account, org = write_context(account)
+    st_id = require_id(service_type_id, "service_type_id")
+    plan = require_id(plan_id, "plan_id")
+    plan_time = require_id(plan_time_id, "plan_time_id")
+    attrs: dict[str, Any] = {}
+    if starts_at is not None:
+        attrs["starts_at"] = clean_iso(starts_at, "starts_at", required=True)
+    if ends_at is not None:
+        attrs["ends_at"] = clean_iso(ends_at, "ends_at", required=True)
+    if time_type is not None:
+        attrs["time_type"] = clean_time_type(time_type)
+    if name is not None:
+        cleaned_name = clean_text(name, "name", required=False)
+        if cleaned_name is not None:
+            attrs["name"] = cleaned_name
+    if team_reminders is not None:
+        attrs["team_reminders"] = clean_team_reminders(team_reminders)
+    if not attrs:
+        raise ValueError("Provide at least one plan-time attribute to update")
+    if "starts_at" in attrs and "ends_at" in attrs:
+        if _parse_instant(attrs["ends_at"]) <= _parse_instant(attrs["starts_at"]):
+            raise ValueError("ends_at must be after starts_at")
+
+    rows = preflight_list(
+        account,
+        f"/service_types/{st_id}/plans/{plan}/plan_times",
+        {"per_page": 100},
+    )
+    row = _find_plan_time(rows, plan_time)
+    if row is None:
+        raise ValueError(
+            f"Plan time {plan_time} not found on plan {plan} under account "
+            f"'{account}' ({org})"
+        )
+    row_attrs = _write_attrs(row)
+    if "starts_at" in attrs or "ends_at" in attrs:
+        effective_start = attrs.get("starts_at") or row_attrs.get("starts_at")
+        effective_end = attrs.get("ends_at") or row_attrs.get("ends_at")
+        if isinstance(effective_start, str) and isinstance(effective_end, str):
+            if _parse_instant(effective_end) <= _parse_instant(effective_start):
+                raise ValueError("ends_at must be after the plan time's starts_at")
+    guard = clean_iso(expected_starts_at, "expected_starts_at", required=True) if expected_starts_at is not None else None
+    if guard is not None:
+        check_expected_time(row_attrs.get("starts_at"), guard, "plan time starts_at")
+
+    return run_write(
+        account=account,
+        operation="update_plan_time",
+        method="PATCH",
+        path=f"/service_types/{st_id}/plan_times/{plan_time}",
+        resource_type="PlanTime",
+        resource_id=plan_time,
+        attributes=attrs,
+        preflight=_plan_time_summary(st_id, plan, plan_time, row_attrs, account, org),
+        confirm=confirm,
+    )
+
+
+@mcp.tool()
+def pco_delete_plan_time(
+    account: str,
+    service_type_id: str,
+    plan_id: str,
+    plan_time_id: str,
+    expected_starts_at: str,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Delete a plan time after an exact current-start check.
+
+    The plan-time collection is preflighted under the same account and the id
+    must exist. Writes require an explicit `account`; "all" and this chat's
+    selection are rejected. confirm=False (default) previews; confirm=True sends
+    one request. Never retried.
+    """
+    account, org = write_context(account)
+    st_id = require_id(service_type_id, "service_type_id")
+    plan = require_id(plan_id, "plan_id")
+    plan_time = require_id(plan_time_id, "plan_time_id")
+    guard = clean_iso(expected_starts_at, "expected_starts_at", required=True)
+
+    rows = preflight_list(
+        account,
+        f"/service_types/{st_id}/plans/{plan}/plan_times",
+        {"per_page": 100},
+    )
+    row = _find_plan_time(rows, plan_time)
+    if row is None:
+        raise ValueError(
+            f"Plan time {plan_time} not found on plan {plan} under account "
+            f"'{account}' ({org})"
+        )
+    row_attrs = _write_attrs(row)
+    check_expected_time(row_attrs.get("starts_at"), guard, "plan time starts_at")
+
+    return run_write(
+        account=account,
+        operation="delete_plan_time",
+        method="DELETE",
+        path=f"/service_types/{st_id}/plan_times/{plan_time}",
+        resource_type="PlanTime",
+        resource_id=plan_time,
+        attributes=None,
+        preflight=_plan_time_summary(st_id, plan, plan_time, row_attrs, account, org),
+        confirm=confirm,
+    )
 
 
 if __name__ == "__main__":
