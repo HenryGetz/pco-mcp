@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import date, timedelta
 from typing import Any, Callable, Optional
 
 import httpx
@@ -1148,6 +1149,319 @@ def pco_person_song_history(
             resolved, name, variants, service_type_id, limit, max_plans, include_declined
         ),
     )
+
+
+def _parse_sort_date(value: Any) -> Optional[date]:
+    """Parse a PCO sort_date (ISO date or ISO datetime); None when absent/invalid."""
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _person_upcoming_single(
+    account: str,
+    name: str,
+    variants: set[str],
+    service_type_id: Optional[str],
+    day_from: date,
+    day_to: date,
+    days: int,
+    include_declined: bool,
+    max_plans: int,
+) -> dict[str, Any]:
+    org = org_name(account)
+    client = get_client(account)
+    _RETRY_STATS.update({"requests": 0, "retries": 0, "rate_limited": 0})
+    window = {"from": day_from.isoformat(), "to": day_to.isoformat(), "days": days}
+
+    def _result(**extra: Any) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "account": account,
+            "org_name": org,
+            "person_name": name,
+            "person_id": None,
+            "ambiguous": False,
+            "candidates": [],
+            "window": window,
+            "matched_plans": 0,
+            "returned_plans": 0,
+            "assignments_count": 0,
+            "scanned_plans": 0,
+            "scan_complete": False,
+            "plans": [],
+            "skipped": [],
+        }
+        result.update(extra)
+        result.update({
+            "requests": _RETRY_STATS["requests"],
+            "retries": _RETRY_STATS["retries"],
+            "rate_limited": _RETRY_STATS["rate_limited"],
+        })
+        return result
+
+    # 1. Resolve the person first: ambiguity or a total miss needs no plan scan.
+    people = _lookup_people(client, name)
+    person_id: Optional[str] = None
+    exact = [
+        p for p in (people or [])
+        if _normalize_person_name(p.get("name")) in variants
+    ]
+    if len(exact) > 1:
+        return _result(
+            ambiguous=True,
+            candidates=exact,
+            note="Multiple people match this name; narrow the name or use a person id.",
+        )
+    if len(exact) == 1:
+        person_id = exact[0]["id"]
+    elif people is not None:
+        return _result(
+            candidates=people[:20],
+            note="No exact person match for this account; candidates are near matches.",
+        )
+    # people is None: the lookup is unavailable, so fall back to name matching
+    # against team members (variants are always passed to _match_team_members).
+
+    # 2. Service types for this account (or the one requested).
+    service_types: list[dict[str, Any]] = []
+    if service_type_id:
+        resp = _get(client, f"/service_types/{service_type_id}")
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Service type {service_type_id} not found under account '{account}' "
+                f"({resp.status_code}): {resp.text[:200]}"
+            )
+        st = resp.json().get("data") or {}
+        service_types = [{
+            "id": str(st.get("id")),
+            "name": (st.get("attributes") or {}).get("name"),
+        }]
+    else:
+        try:
+            for st in _iter_pages(client, "/service_types"):
+                service_types.append({
+                    "id": str(st.get("id")),
+                    "name": (st.get("attributes") or {}).get("name"),
+                })
+        except RuntimeError as exc:
+            raise RuntimeError(f"Could not list service types: {exc}") from exc
+
+    if not service_types:
+        raise RuntimeError(f"No service types found under account '{account}'")
+
+    # 3. Collect future plans inside the window, oldest first per service type.
+    stubs: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    failed_sts = 0
+    for st in service_types:
+        try:
+            for plan in _iter_pages(
+                client,
+                f"/service_types/{st['id']}/plans",
+                {"filter": "future", "order": "sort_date"},
+            ):
+                attrs = plan.get("attributes") or {}
+                sort_date = attrs.get("sort_date")
+                parsed = _parse_sort_date(sort_date)
+                if parsed is None:
+                    skipped.append(
+                        f"plan {plan.get('id')} ({st['name']}): "
+                        f"missing or unparseable sort_date {sort_date!r}"
+                    )
+                    continue
+                if parsed > day_to:
+                    break
+                if parsed < day_from:
+                    continue
+                stubs.append({
+                    "id": str(plan.get("id")),
+                    "service_type_id": st["id"],
+                    "service_type_name": st["name"],
+                    "title": attrs.get("title") or attrs.get("dates"),
+                    "dates": attrs.get("dates"),
+                    "sort_date": sort_date,
+                    "date": parsed.isoformat(),
+                })
+        except (RuntimeError, httpx.HTTPError) as exc:
+            failed_sts += 1
+            skipped.append(f"{st['name']} ({st['id']}): {exc}")
+
+    # Raise only when nothing at all could be read; partial rows stay useful.
+    if not stubs and failed_sts == len(service_types):
+        raise RuntimeError(
+            "Could not read future plans for any service type: " + "; ".join(skipped)
+        )
+
+    stubs.sort(key=lambda p: (p["date"], p["service_type_name"] or "", p["id"]))
+    truncated = len(stubs) > max_plans
+    if truncated:
+        stubs = stubs[:max_plans]
+
+    # 4. Match the person on each plan and pull plan times only for hits.
+    plans_out: list[dict[str, Any]] = []
+    scanned = 0
+    assignments_count = 0
+    plan_scan_errors = 0
+    for stub in stubs:
+        scanned += 1
+        try:
+            matches = _match_team_members(
+                client, stub["service_type_id"], stub["id"], person_id, variants
+            )
+        except (RuntimeError, httpx.HTTPError) as exc:
+            plan_scan_errors += 1
+            skipped.append(f"plan {stub['id']}: {exc}")
+            continue
+        if not matches:
+            continue
+        if not include_declined:
+            matches = [m for m in matches if m.get("status") != "D"]
+            if not matches:
+                continue
+
+        plan_times, plan_times_error = _fetch_plan_times(
+            client, stub["service_type_id"], stub["id"]
+        )
+        starts_at = None
+        for row in plan_times:
+            if row.get("time_type") == "service" and row.get("starts_at"):
+                starts_at = row["starts_at"]
+                break
+        if starts_at is None:
+            for row in plan_times:
+                if row.get("starts_at"):
+                    starts_at = row["starts_at"]
+                    break
+
+        positions: list[str] = []
+        statuses: list[str] = []
+        for match in matches:
+            position = match.get("position")
+            if position and position not in positions:
+                positions.append(position)
+            status = match.get("status")
+            if status and status not in statuses:
+                statuses.append(status)
+
+        plan: dict[str, Any] = {
+            "plan_id": stub["id"],
+            "service_type_id": stub["service_type_id"],
+            "service_type_name": stub["service_type_name"],
+            "title": stub["title"],
+            "dates": stub["dates"],
+            "sort_date": stub["sort_date"],
+            "date": stub["date"],
+            "starts_at": starts_at,
+            "plan_times": plan_times,
+            "positions": positions,
+            "statuses": statuses,
+            "assignments": matches,
+            "account": account,
+            "org_name": org,
+        }
+        if plan_times_error:
+            plan["plan_times_error"] = plan_times_error
+        plans_out.append(plan)
+        assignments_count += len(matches)
+
+    # A complete scan means no max_plans truncation, every service type's plan
+    # listing succeeded, and every collected plan's team_members read succeeded.
+    # plan_times failures are reported per plan and do not clear scan_complete.
+    scan_complete = not truncated and failed_sts == 0 and plan_scan_errors == 0
+    return _result(
+        person_id=person_id,
+        matched_plans=len(plans_out),
+        returned_plans=len(plans_out),
+        assignments_count=assignments_count,
+        scanned_plans=scanned,
+        scan_complete=scan_complete,
+        plans=plans_out,
+        skipped=skipped,
+    )
+
+
+@mcp.tool()
+def pco_person_upcoming(
+    person_name: str = "",
+    days: int = 21,
+    account: Optional[str] = None,
+    service_type_id: Optional[str] = None,
+    include_declined: bool = False,
+    max_plans: int = 80,
+) -> dict[str, Any]:
+    """List the future plans a person is scheduled for, soonest first.
+
+    Scans future plans from today through today+days (inclusive) across all service
+    types unless service_type_id is given, matching the person in each plan's team
+    members (name, case/whitespace insensitive, 'Last, First' accepted; person id is
+    used when the name resolves to exactly one Services person). Plans are capped at
+    max_plans total after sorting by date; scan_complete is False when that cap
+    truncated the scan or when any service-type plan listing or plan team_members
+    request failed (the failures are listed in skipped). Ambiguous or unmatched names
+    return candidates and never scan plans. Assignments the person declined (status D)
+    are dropped unless include_declined=True; a plan left with no assignments is
+    skipped. Plan times and the service start (starts_at) are fetched only for
+    matched plans; a plan-times failure is reported per plan via plan_times_error
+    instead of failing the call.
+    Read-only: only GETs are issued.
+
+    Account routing: omitted `account` uses this chat's selection
+    (`pco_use_account`), else the installation default; an explicit name always
+    overrides; `"all"` fans out over every configured org and returns a merged,
+    time-ordered `plans` list plus a `summary` block.
+    """
+    name = (person_name or "").strip()
+    if not name:
+        raise ValueError("person_name is required")
+    if days < 1 or days > 366:
+        raise ValueError("days must be between 1 and 366")
+    if max_plans < 1:
+        raise ValueError("max_plans must be >= 1")
+
+    day_from = date.today()
+    day_to = day_from + timedelta(days=days)
+    window = {"from": day_from.isoformat(), "to": day_to.isoformat(), "days": days}
+    variants = _person_name_variants(name)
+
+    result = _dispatch(
+        account,
+        lambda resolved: _person_upcoming_single(
+            resolved, name, variants, service_type_id,
+            day_from, day_to, days, include_declined, max_plans,
+        ),
+    )
+
+    if isinstance(result, dict) and result.get("account_source") == "all":
+        plans: list[dict[str, Any]] = []
+        matched = 0
+        assignments = 0
+        for entry in result.get("results") or []:
+            data = entry.get("data") or {}
+            plans.extend(data.get("plans") or [])
+            matched += int(data.get("matched_plans") or 0)
+            assignments += int(data.get("assignments_count") or 0)
+        plans.sort(key=lambda p: (
+            p.get("starts_at") or p.get("sort_date") or "",
+            p.get("account") or "",
+            p.get("service_type_name") or "",
+        ))
+        result.update({
+            "person_name": name,
+            "window": window,
+            "plans": plans,
+            "count": len(plans),
+            "summary": {
+                "accounts_queried": len(result.get("accounts") or []),
+                "accounts_succeeded": len(result.get("results") or []),
+                "accounts_failed": len(result.get("errors") or []),
+                "matched_plans": matched,
+                "assignments": assignments,
+            },
+        })
+    return result
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 # pco-mcp
 
-A [FastMCP](https://github.com/jlowin/fastmcp) stdio server for the **Planning Center Online Services API v2**. It exposes ten tools for reading service types, plans, setlists, songs, arrangements and a person's song history across one or many Planning Center organizations, and is registered with [omp](https://github.com/ompfine/omp) as `pco`. Account routing is per chat: each chat can pick its own account without disturbing any other chat.
+A [FastMCP](https://github.com/jlowin/fastmcp) stdio server for the **Planning Center Online Services API v2**. It exposes eleven tools for reading service types, plans, setlists, songs, arrangements, a person's song history and upcoming assignments across one or many Planning Center organizations, and is registered with [omp](https://github.com/ompfine/omp) as `pco`. Account routing is per chat: each chat can pick its own account without disturbing any other chat.
 
-Read-only: every tool issues `GET` against `https://api.planningcenteronline.com/services/v2`. Nothing is written back to Planning Center.
+Read-only: every tool issues `GET` against `https://api.planningcenteronline.com/services/v2`; there are no create, update, or delete tools. Nothing is written back to Planning Center. See [Read-only safety](#read-only-safety).
 
 ## Accounts
 
@@ -121,7 +121,8 @@ Fan-out tools return an envelope instead of a single-account result:
 
 `data` is that account's normal single-account result: a list for
 `pco_list_service_types`, `pco_list_plans`, and `pco_search_songs`; a dict for
-`pco_get_plan`, `pco_get_song`, and `pco_person_song_history`. One account failing does
+`pco_get_plan`, `pco_get_song`, `pco_person_song_history`, and
+`pco_person_upcoming`. One account failing does
 not discard the others — the failure is listed in `errors` and every successful account
 stays in `results`. If every account fails, the call raises a `RuntimeError` aggregating
 the messages.
@@ -138,7 +139,7 @@ name. Both `orgName` and `org_name` are accepted on read; the server writes came
 
 ## Tools
 
-Ten tools. Every tool with an `account` parameter resolves it the same way: omitted
+Eleven tools. Every tool with an `account` parameter resolves it the same way: omitted
 uses this chat's `pco_use_account` selection, else the installation default snapshot;
 a name always wins over the chat selection; `"all"` fans out over every configured
 account and ignores the selection. Results carry `account_source`.
@@ -269,6 +270,70 @@ Semantics worth knowing:
 - **Requests are paced** to stay under Planning Center's 100-requests-per-20s per-app limit, with backoff on `429`/`5xx`. `requests`, `retries`, and `rate_limited` report what happened; a history call costs several requests per plan.
 - Failures are non-fatal where possible: a service type or plan that errors is listed in `skipped` and the rest continues. If no service type could be read at all, the call raises.
 
+### `pco_person_upcoming(person_name="", days=21, account=None, service_type_id=None, include_declined=False, max_plans=80) -> dict`
+The plan assignments on a person's calendar for the upcoming window, **earliest first**.
+This is the forward-looking counterpart to `pco_person_song_history`: it returns plans,
+plan times, positions, and statuses, not songs.
+
+`person_name` is required and matched exactly like `pco_person_song_history`
+(case- and whitespace-insensitive; `"Last, First"` accepted). Several exact matches
+return `ambiguous: true` with `candidates` instead of guessing; no exact match returns
+`candidates` (near matches) and a note. No match is not an error.
+
+The window is **today through today + `days`, inclusive**, evaluated per account. The
+scan covers future plans, optionally restricted to one `service_type_id`, and matches
+the person against each plan's `team_members`.
+
+Returned fields for one account: `account`, `org_name`, `account_source`,
+`person_name`, `person_id`, `ambiguous`, `candidates`, `window` (the resolved inclusive
+range and day count), `matched_plans`, `returned_plans`, `assignments_count`,
+`scanned_plans`, `scan_complete`, `plans`, `skipped`, `requests`, `retries`, and
+`rate_limited`. Each plan entry carries `plan_id`, `date`, `dates`, `title`,
+`service_type_id`, `service_type_name`, `plan_times`, `starts_at` (the service start
+when a service PlanTime exists, else the first plan time with a timestamp),
+`positions`, `statuses`, `assignments`, and the `account` / `org_name` tags.
+Assignment objects use the same fields as `pco_person_song_history`
+(`person_id`, `name`, `position`, `status`, `status_label`, `decline_reason`,
+`status_updated_at`).
+
+Semantics worth knowing:
+
+- **Declined assignments are excluded by default.** Status `D` is dropped; pass
+  `include_declined=True` to keep it. A plan is only returned when the person has at
+  least one surviving assignment.
+- **`plan_times` is the full schedule for the plan**, sorted by `starts_at`, so a plan
+  with several services or rehearsals is not reduced to a single timestamp.
+- **`matched_plans`, `scanned_plans`, and `scan_complete` describe the scan.**
+  `max_plans` caps plans scanned (default 80) to bound runtime; `scan_complete` reports
+  whether the window was fully covered without `max_plans` truncation or request
+  failures. `skipped` lists plans or service types that errored without aborting the
+  rest.
+- **Requests are paced** as in `pco_person_song_history`; the same request counters
+  report what happened.
+
+With `account="all"`, the result is the normal fan-out envelope (`account_source`,
+`accounts`, `results`, `errors`) plus three merged top-level fields:
+
+- `plans` — every successful account's matched plans, flattened and sorted by date.
+- `count` — the number of merged plan entries.
+- `summary` — `{accounts_queried, accounts_succeeded, accounts_failed, matched_plans,
+  assignments}` across the fan-out.
+
+A failing account is listed in `errors`; every other account's plans remain in
+`results` and in the merged `plans`, so partial failure keeps the successes. If every
+account fails, the call raises like other fan-out tools. This tool only reads.
+
+## Read-only safety
+
+All eleven tools are read-only against Planning Center. The server exposes no mutation
+tools, and every upstream request is an HTTP `GET`; there is no create, update, or
+delete path. Account selection changes only *which* organization is read: a selected
+account cannot cause a wrong-account write because no write exists.
+
+An AST-based regression test in `tests/` fails if `post`, `put`, `patch`, `delete`,
+`request`, or `send` appears in `server.py` or `pco_accounts.py`, so the invariant is
+enforced by the test suite rather than by convention.
+
 ## Setup
 
 Requirements: Python 3.12+, a Planning Center account with a **Personal Access Token** (appId + secret).
@@ -393,6 +458,7 @@ pco_search_songs("Great Are You Lord", account="rs")
 pco_get_song("654321", account="rs")
 pco_person_song_history(account="rs", person_name="Alex Morgan", limit=15)
 pco_person_song_history(account="rs", person_name="Getz, Henry", limit=50, max_plans=500, include_declined=True)
+pco_person_upcoming(person_name="Alex Morgan", days=14, account="all")
 ```
 
 ## No secrets in the repo
