@@ -3,62 +3,44 @@
 
 Integrates with Planning Center Services API (v2) using credentials from
 ~/.mpco_credentials.json or environment variables.
+
+Every tool that talks to PCO takes ``account``: omitted uses the configured
+default account, ``"all"`` fans out over every configured account.
 """
 
 from __future__ import annotations
 
-import base64
-import json
 import os
 import re
+import sys
+import threading
 import time
-from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 from fastmcp import FastMCP
 
+# The deployed server.py is a symlink outside the repo, so sys.path[0] is the
+# deployed directory. Put the real repo directory first to find pco_accounts.py.
+_REPO_DIR = os.path.dirname(os.path.realpath(__file__))
+if _REPO_DIR not in sys.path:
+    sys.path.insert(0, _REPO_DIR)
+
+from pco_accounts import (
+    AccountError,
+    account_meta,
+    credentials,
+    default_account,
+    fan_out,
+    get_client,
+    is_all,
+    list_accounts,
+    org_name,
+    resolve_accounts,
+    set_default_account,
+)
+
 mcp = FastMCP("planning-center")
-
-CREDS_FILE = Path(os.path.expanduser("~/.mpco_credentials.json"))
-PCO_BASE_URL = "https://api.planningcenteronline.com/services/v2"
-
-
-def get_credentials(account: str = "unw") -> tuple[str, str]:
-    """Retrieve PCO appId and secret for the specified account."""
-    env_id = os.environ.get("PCO_APP_ID")
-    env_secret = os.environ.get("PCO_SECRET") or os.environ.get("PCO_APP_SECRET")
-    if env_id and env_secret:
-        return env_id, env_secret
-
-    if CREDS_FILE.is_file():
-        try:
-            creds = json.loads(CREDS_FILE.read_text(encoding="utf-8"))
-            if account in creds:
-                acct = creds[account]
-                return acct["appId"], acct.get("appSecret") or acct.get("secret")
-            # Fall back to first available account
-            if creds:
-                first_key = next(iter(creds))
-                acct = creds[first_key]
-                return acct["appId"], acct.get("appSecret") or acct.get("secret")
-        except Exception as e:
-            raise RuntimeError(f"Failed to read {CREDS_FILE}: {e}")
-
-    raise RuntimeError(
-        f"No credentials found for account '{account}'. Please configure ~/.mpco_credentials.json or set PCO_APP_ID / PCO_SECRET."
-    )
-
-
-def make_client(account: str = "unw") -> httpx.Client:
-    app_id, secret = get_credentials(account)
-    auth_str = base64.b64encode(f"{app_id}:{secret}".encode()).decode()
-    headers = {
-        "Authorization": f"Basic {auth_str}",
-        "Accept": "application/json",
-        "User-Agent": "PlanningCenter-MCP/1.0",
-    }
-    return httpx.Client(base_url=PCO_BASE_URL, headers=headers, timeout=30.0)
 
 
 def extract_plan_id(plan_id_or_url: str | int) -> str:
@@ -71,33 +53,137 @@ def extract_plan_id(plan_id_or_url: str | int) -> str:
     raise ValueError(f"Could not extract numeric plan ID from '{plan_id_or_url}'")
 
 
-@mcp.tool()
-def pco_list_accounts() -> list[str]:
-    """List all configured Planning Center account names in ~/.mpco_credentials.json."""
-    if not CREDS_FILE.is_file():
-        return []
+def _dispatch(account: Optional[str], call: Callable[[str], Any]) -> Any:
+    """Run ``call`` for the resolved account, or fan out over every account for "all"."""
+    if is_all(account):
+        return fan_out(resolve_accounts(account), call)
+    return call(resolve_accounts(account)[0])
+
+
+def _has_credentials(account: str) -> bool:
     try:
-        creds = json.loads(CREDS_FILE.read_text(encoding="utf-8"))
-        return list(creds.keys())
-    except Exception:
-        return []
+        credentials(account)
+    except AccountError:
+        return False
+    return True
 
 
 @mcp.tool()
-def pco_list_service_types(account: str = "unw") -> list[dict[str, Any]]:
+def pco_list_accounts(detailed: bool = False) -> list[str] | list[dict[str, Any]]:
+    """List configured Planning Center account names.
+
+    detailed=True adds org_name, default flag, and credential presence per account.
+    """
+    names = list_accounts()
+    if not detailed:
+        return list(names)
+
+    try:
+        current_default: Optional[str] = default_account()
+    except AccountError:
+        current_default = None
+
+    out: list[dict[str, Any]] = []
+    for name in names:
+        meta = account_meta(name)
+        out.append({
+            "account": meta["account"],
+            "org_name": meta["org_name"],
+            "default": name == current_default,
+            "has_credentials": _has_credentials(name),
+        })
+    return out
+
+
+@mcp.tool()
+def pco_set_default_account(account: str) -> dict[str, Any]:
+    """Persist the account used when a tool call omits `account`. Rejects "all"."""
+    name = (account or "").strip()
+    if not name:
+        raise ValueError("account is required")
+    if is_all(name):
+        raise ValueError("Cannot set 'all' as the default account")
+    resolve_accounts(name)  # validates the name against configured accounts
+    config_file = set_default_account(name)
+    return {
+        "default_account": name,
+        "config_file": config_file,
+        "accounts": list_accounts(),
+    }
+
+
+def _list_service_types_single(account: str) -> list[dict[str, Any]]:
+    client = get_client(account)
+    org = org_name(account)
+    resp = _get(client, "/service_types", {"per_page": 100})
+    resp.raise_for_status()
+    data = resp.json().get("data", [])
+    return [
+        {
+            "id": st["id"],
+            "name": st["attributes"].get("name"),
+            "frequency": st["attributes"].get("frequency"),
+            "account": account,
+            "org_name": org,
+        }
+        for st in data
+    ]
+
+
+@mcp.tool()
+def pco_list_service_types(account: Optional[str] = None) -> list[dict[str, Any]] | dict[str, Any]:
     """List all service types (e.g. Sunday Morning, Youth, Chapels) for the specified account."""
-    with make_client(account) as client:
-        resp = client.get("/service_types?per_page=100")
-        resp.raise_for_status()
-        data = resp.json().get("data", [])
-        return [
-            {
-                "id": st["id"],
-                "name": st["attributes"].get("name"),
-                "frequency": st["attributes"].get("frequency"),
-            }
-            for st in data
-        ]
+    return _dispatch(account, _list_service_types_single)
+
+
+def _list_plans_single(
+    service_type_id: Optional[str],
+    filter: str,
+    per_page: int,
+    account: str,
+) -> list[dict[str, Any]]:
+    client = get_client(account)
+    org = org_name(account)
+
+    st_names: dict[str, Optional[str]] = {}
+    if service_type_id:
+        st_ids = [str(service_type_id)]
+        try:
+            st_resp: Optional[httpx.Response] = _get(client, f"/service_types/{st_ids[0]}")
+        except httpx.HTTPError:
+            st_resp = None
+        if st_resp is not None and st_resp.status_code == 200:
+            st = st_resp.json().get("data") or {}
+            st_names[st_ids[0]] = (st.get("attributes") or {}).get("name")
+        else:
+            st_names[st_ids[0]] = None
+    else:
+        sts_resp = _get(client, "/service_types", {"per_page": 100})
+        sts = sts_resp.json().get("data", []) if sts_resp.status_code == 200 else []
+        st_ids = [st["id"] for st in sts]
+        st_names = {st["id"]: (st.get("attributes") or {}).get("name") for st in sts}
+
+    plans_out: list[dict[str, Any]] = []
+    for st_id in st_ids:
+        params: dict[str, Any] = {"per_page": per_page, "order": "sort_date"}
+        if filter in ("future", "past"):
+            params["filter"] = filter
+        resp = _get(client, f"/service_types/{st_id}/plans", params)
+        if resp.status_code != 200:
+            continue
+        for p in resp.json().get("data", []):
+            attrs = p["attributes"]
+            plans_out.append({
+                "id": p["id"],
+                "service_type_id": st_id,
+                "service_type_name": st_names.get(st_id),
+                "title": attrs.get("title") or attrs.get("dates"),
+                "dates": attrs.get("dates"),
+                "sort_date": attrs.get("sort_date"),
+                "account": account,
+                "org_name": org,
+            })
+    return plans_out
 
 
 @mcp.tool()
@@ -105,214 +191,273 @@ def pco_list_plans(
     service_type_id: Optional[str] = None,
     filter: str = "future",
     per_page: int = 10,
-    account: str = "unw",
-) -> list[dict[str, Any]]:
+    account: Optional[str] = None,
+) -> list[dict[str, Any]] | dict[str, Any]:
     """List plans for a service type (or across service types if service_type_id is omitted).
 
     filter can be 'future', 'past', or 'all'.
     """
-    with make_client(account) as client:
-        st_ids: list[str] = []
-        if service_type_id:
-            st_ids = [str(service_type_id)]
-        else:
-            sts = client.get("/service_types?per_page=100").json().get("data", [])
-            st_ids = [st["id"] for st in sts]
+    return _dispatch(
+        account,
+        lambda name: _list_plans_single(service_type_id, filter, per_page, name),
+    )
 
-        plans_out = []
-        for st_id in st_ids:
-            query = f"/service_types/{st_id}/plans?per_page={per_page}&order=sort_date"
-            if filter in ("future", "past"):
-                query += f"&filter={filter}"
-            resp = client.get(query)
-            if resp.status_code != 200:
-                continue
-            for p in resp.json().get("data", []):
-                attrs = p["attributes"]
-                plans_out.append({
-                    "id": p["id"],
-                    "service_type_id": st_id,
-                    "title": attrs.get("title") or attrs.get("dates"),
-                    "dates": attrs.get("dates"),
-                    "sort_date": attrs.get("sort_date"),
-                })
-        return plans_out
+
+def _fetch_plan_times(
+    client: httpx.Client,
+    service_type_id: str,
+    plan_id: str,
+) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """PlanTime rows sorted by starts_at; non-200 becomes an error string, never a failure."""
+    path = f"/service_types/{service_type_id}/plans/{plan_id}/plan_times"
+    try:
+        resp = _get(client, path, {"per_page": 100})
+    except httpx.HTTPError as exc:
+        return [], str(exc)
+    if resp.status_code != 200:
+        return [], f"GET {path} failed ({resp.status_code}): {resp.text[:200]}"
+    rows = []
+    for row in resp.json().get("data", []):
+        attrs = row.get("attributes", {})
+        rows.append({
+            "id": row.get("id"),
+            "name": attrs.get("name"),
+            "time_type": attrs.get("time_type"),
+            "starts_at": attrs.get("starts_at"),
+            "ends_at": attrs.get("ends_at"),
+        })
+    rows.sort(key=lambda t: (t["starts_at"] is None, t["starts_at"] or ""))
+    return rows, None
+
+
+def _get_plan_single(
+    plan_id: str,
+    account: str,
+    include_attachments: bool,
+) -> dict[str, Any]:
+    client = get_client(account)
+    org = org_name(account)
+
+    # Find which service_type contains this plan
+    sts_resp = _get(client, "/service_types", {"per_page": 100})
+    sts_resp.raise_for_status()
+    st_data = sts_resp.json().get("data", [])
+
+    st_id = None
+    plan_raw = None
+    for st in st_data:
+        cand_id = st["id"]
+        check_resp = _get(client, f"/service_types/{cand_id}/plans/{plan_id}")
+        if check_resp.status_code == 200:
+            st_id = cand_id
+            plan_raw = check_resp.json().get("data")
+            break
+
+    if not st_id or not plan_raw:
+        raise RuntimeError(f"Plan {plan_id} not found under account '{account}' ({org})")
+
+    plan_attrs = plan_raw.get("attributes", {})
+    plan_title = plan_attrs.get("title") or plan_attrs.get("dates") or f"Plan {plan_id}"
+
+    # Fetch items with included song, arrangement, and key
+    items_resp = _get(
+        client,
+        f"/service_types/{st_id}/plans/{plan_id}/items",
+        {"include": "song,arrangement,key,item_notes", "per_page": 100},
+    )
+    items_resp.raise_for_status()
+    raw_items = items_resp.json()
+
+    included_map = {f"{x['type']}:{x['id']}": x for x in raw_items.get("included", [])}
+
+    items_out = []
+    for item in raw_items.get("data", []):
+        i_attrs = item.get("attributes", {})
+        item_type = i_attrs.get("item_type")
+        title = i_attrs.get("title") or "Untitled"
+        sequence = i_attrs.get("sequence")
+        description = i_attrs.get("description")
+
+        item_dict: dict[str, Any] = {
+            "sequence": sequence,
+            "title": title,
+            "type": item_type,
+            "description": description,
+            "account": account,
+            "org_name": org,
+        }
+
+        if item_type == "song":
+            song_rel = item.get("relationships", {}).get("song", {}).get("data")
+            arr_rel = item.get("relationships", {}).get("arrangement", {}).get("data")
+            key_rel = item.get("relationships", {}).get("key", {}).get("data")
+
+            song_obj = included_map.get(f"Song:{song_rel['id']}") if song_rel else None
+            arr_obj = included_map.get(f"Arrangement:{arr_rel['id']}") if arr_rel else None
+            key_obj = included_map.get(f"Key:{key_rel['id']}") if key_rel else None
+
+            song_attrs = song_obj.get("attributes", {}) if song_obj else {}
+            arr_attrs = arr_obj.get("attributes", {}) if arr_obj else {}
+            key_attrs = key_obj.get("attributes", {}) if key_obj else {}
+
+            key_name = (
+                i_attrs.get("key_name")
+                or key_attrs.get("name")
+                or key_attrs.get("starting_key")
+                or arr_attrs.get("default_key")
+            )
+
+            item_dict.update({
+                "song_id": song_rel.get("id") if song_rel else None,
+                "song_title": song_attrs.get("title") or title,
+                "author": song_attrs.get("author"),
+                "ccli_number": song_attrs.get("ccli_number"),
+                "arrangement_id": arr_rel.get("id") if arr_rel else None,
+                "arrangement_name": arr_attrs.get("name"),
+                "key": key_name,
+                "bpm": arr_attrs.get("bpm"),
+                "meter": arr_attrs.get("meter"),
+                "arrangement_notes": arr_attrs.get("notes"),
+            })
+
+            if include_attachments and song_rel and arr_rel:
+                att_url = f"/songs/{song_rel['id']}/arrangements/{arr_rel['id']}/attachments"
+                att_resp = _get(client, att_url)
+                if att_resp.status_code == 200:
+                    atts = []
+                    for a in att_resp.json().get("data", []):
+                        aa = a.get("attributes", {})
+                        atts.append({
+                            "id": a.get("id"),
+                            "filename": aa.get("filename"),
+                            "filetype": aa.get("filetype"),
+                            "display_name": aa.get("display_name"),
+                        })
+                    item_dict["attachments"] = atts
+
+        items_out.append(item_dict)
+
+    items_out.sort(key=lambda x: x.get("sequence") or 0)
+
+    plan_times, plan_times_error = _fetch_plan_times(client, st_id, plan_id)
+
+    result: dict[str, Any] = {
+        "plan_id": plan_id,
+        "title": plan_title,
+        "dates": plan_attrs.get("dates"),
+        "sort_date": plan_attrs.get("sort_date"),
+        "service_type_id": st_id,
+        "account": account,
+        "org_name": org,
+        "counts": {
+            "service_time_count": plan_attrs.get("service_time_count"),
+            "rehearsal_time_count": plan_attrs.get("rehearsal_time_count"),
+            "other_time_count": plan_attrs.get("other_time_count"),
+            "plan_people_count": plan_attrs.get("plan_people_count"),
+            "items_count": plan_attrs.get("items_count"),
+            "total_length": plan_attrs.get("total_length"),
+            "multi_day": plan_attrs.get("multi_day"),
+        },
+        "plan_times": plan_times,
+        "items": items_out,
+    }
+    if plan_times_error:
+        result["plan_times_error"] = plan_times_error
+    return result
 
 
 @mcp.tool()
 def pco_get_plan(
     plan_id_or_url: str,
-    account: str = "unw",
+    account: Optional[str] = None,
     include_attachments: bool = True,
 ) -> dict[str, Any]:
     """Retrieve full plan details, setlist order, songs, arrangements, keys, notes, and attachments from a plan ID or URL."""
     plan_id = extract_plan_id(plan_id_or_url)
-    with make_client(account) as client:
-        # Find which service_type contains this plan
-        sts_resp = client.get("/service_types?per_page=100")
-        sts_resp.raise_for_status()
-        st_data = sts_resp.json().get("data", [])
+    if is_all(account):
+        envelope = fan_out(
+            resolve_accounts(account),
+            lambda name: _get_plan_single(plan_id, name, include_attachments),
+        )
+        envelope["ambiguous"] = len(envelope["results"]) > 1
+        return envelope
+    return _get_plan_single(plan_id, resolve_accounts(account)[0], include_attachments)
 
-        st_id = None
-        plan_raw = None
-        for st in st_data:
-            cand_id = st["id"]
-            check_resp = client.get(f"/service_types/{cand_id}/plans/{plan_id}")
-            if check_resp.status_code == 200:
-                st_id = cand_id
-                plan_raw = check_resp.json().get("data")
-                break
 
-        if not st_id or not plan_raw:
-            raise RuntimeError(f"Plan {plan_id} not found under account '{account}'")
-
-        plan_attrs = plan_raw.get("attributes", {})
-        plan_title = plan_attrs.get("title") or plan_attrs.get("dates") or f"Plan {plan_id}"
-
-        # Fetch items with included song, arrangement, and key
-        items_url = f"/service_types/{st_id}/plans/{plan_id}/items?include=song,arrangement,key,item_notes&per_page=100"
-        items_resp = client.get(items_url)
-        items_resp.raise_for_status()
-        raw_items = items_resp.json()
-
-        included_map = {f"{x['type']}:{x['id']}": x for x in raw_items.get("included", [])}
-
-        items_out = []
-        for item in raw_items.get("data", []):
-            i_attrs = item.get("attributes", {})
-            item_type = i_attrs.get("item_type")
-            title = i_attrs.get("title") or "Untitled"
-            sequence = i_attrs.get("sequence")
-            description = i_attrs.get("description")
-
-            item_dict: dict[str, Any] = {
-                "sequence": sequence,
-                "title": title,
-                "type": item_type,
-                "description": description,
-            }
-
-            if item_type == "song":
-                song_rel = item.get("relationships", {}).get("song", {}).get("data")
-                arr_rel = item.get("relationships", {}).get("arrangement", {}).get("data")
-                key_rel = item.get("relationships", {}).get("key", {}).get("data")
-
-                song_obj = included_map.get(f"Song:{song_rel['id']}") if song_rel else None
-                arr_obj = included_map.get(f"Arrangement:{arr_rel['id']}") if arr_rel else None
-                key_obj = included_map.get(f"Key:{key_rel['id']}") if key_rel else None
-
-                song_attrs = song_obj.get("attributes", {}) if song_obj else {}
-                arr_attrs = arr_obj.get("attributes", {}) if arr_obj else {}
-                key_attrs = key_obj.get("attributes", {}) if key_obj else {}
-
-                key_name = (
-                    i_attrs.get("key_name")
-                    or key_attrs.get("name")
-                    or key_attrs.get("starting_key")
-                    or arr_attrs.get("default_key")
-                )
-
-                item_dict.update({
-                    "song_id": song_rel.get("id") if song_rel else None,
-                    "song_title": song_attrs.get("title") or title,
-                    "author": song_attrs.get("author"),
-                    "ccli_number": song_attrs.get("ccli_number"),
-                    "arrangement_id": arr_rel.get("id") if arr_rel else None,
-                    "arrangement_name": arr_attrs.get("name"),
-                    "key": key_name,
-                    "bpm": arr_attrs.get("bpm"),
-                    "meter": arr_attrs.get("meter"),
-                    "arrangement_notes": arr_attrs.get("notes"),
-                })
-
-                if include_attachments and song_rel and arr_rel:
-                    att_url = f"/songs/{song_rel['id']}/arrangements/{arr_rel['id']}/attachments"
-                    att_resp = client.get(att_url)
-                    if att_resp.status_code == 200:
-                        atts = []
-                        for a in att_resp.json().get("data", []):
-                            aa = a.get("attributes", {})
-                            atts.append({
-                                "id": a.get("id"),
-                                "filename": aa.get("filename"),
-                                "filetype": aa.get("filetype"),
-                                "display_name": aa.get("display_name"),
-                            })
-                        item_dict["attachments"] = atts
-
-            items_out.append(item_dict)
-
-        items_out.sort(key=lambda x: x.get("sequence") or 0)
-
-        return {
-            "plan_id": plan_id,
-            "title": plan_title,
-            "dates": plan_attrs.get("dates"),
-            "sort_date": plan_attrs.get("sort_date"),
-            "service_type_id": st_id,
-            "items": items_out,
+def _search_songs_single(query: str, per_page: int, account: str) -> list[dict[str, Any]]:
+    client = get_client(account)
+    org = org_name(account)
+    resp = _get(client, "/songs", {"where[title]": query, "per_page": per_page})
+    data = resp.json().get("data", []) if resp.status_code == 200 else []
+    if not data:
+        # Fall back to general filter
+        resp = _get(client, "/songs", {"order": "title", "per_page": per_page})
+        resp.raise_for_status()
+        data = resp.json().get("data", [])
+    return [
+        {
+            "id": s["id"],
+            "title": s["attributes"].get("title"),
+            "author": s["attributes"].get("author"),
+            "ccli_number": s["attributes"].get("ccli_number"),
+            "account": account,
+            "org_name": org,
         }
+        for s in data
+    ]
 
 
 @mcp.tool()
 def pco_search_songs(
     query: str,
     per_page: int = 10,
-    account: str = "unw",
-) -> list[dict[str, Any]]:
+    account: Optional[str] = None,
+) -> list[dict[str, Any]] | dict[str, Any]:
     """Search for songs in the Planning Center library by title or keyword."""
-    with make_client(account) as client:
-        resp = client.get(f"/songs?where[title]={query}&per_page={per_page}")
-        if resp.status_code != 200 or not resp.json().get("data"):
-            # Fall back to general filter
-            resp = client.get(f"/songs?order=title&per_page={per_page}")
-        resp.raise_for_status()
-        data = resp.json().get("data", [])
-        return [
-            {
-                "id": s["id"],
-                "title": s["attributes"].get("title"),
-                "author": s["attributes"].get("author"),
-                "ccli_number": s["attributes"].get("ccli_number"),
-            }
-            for s in data
-        ]
+    return _dispatch(account, lambda name: _search_songs_single(query, per_page, name))
+
+
+def _get_song_single(song_id: str | int, account: str) -> dict[str, Any]:
+    sid = str(song_id).strip()
+    client = get_client(account)
+    org = org_name(account)
+    resp = _get(client, f"/songs/{sid}", {"include": "arrangements"})
+    resp.raise_for_status()
+    raw = resp.json()
+    song_attrs = raw.get("data", {}).get("attributes", {})
+
+    arrangements = []
+    for inc in raw.get("included", []):
+        if inc.get("type") == "Arrangement":
+            attrs = inc.get("attributes", {})
+            arrangements.append({
+                "id": inc.get("id"),
+                "name": attrs.get("name"),
+                "bpm": attrs.get("bpm"),
+                "meter": attrs.get("meter"),
+                "default_key": attrs.get("default_key"),
+                "notes": attrs.get("notes"),
+            })
+
+    return {
+        "id": sid,
+        "title": song_attrs.get("title"),
+        "author": song_attrs.get("author"),
+        "ccli_number": song_attrs.get("ccli_number"),
+        "copyright": song_attrs.get("copyright"),
+        "arrangements": arrangements,
+        "account": account,
+        "org_name": org,
+    }
 
 
 @mcp.tool()
 def pco_get_song(
     song_id: str | int,
-    account: str = "unw",
+    account: Optional[str] = None,
 ) -> dict[str, Any]:
     """Retrieve details for a specific song including all arrangements, keys, and metadata."""
-    sid = str(song_id).strip()
-    with make_client(account) as client:
-        resp = client.get(f"/songs/{sid}?include=arrangements")
-        resp.raise_for_status()
-        raw = resp.json()
-        song_attrs = raw.get("data", {}).get("attributes", {})
-
-        arrangements = []
-        for inc in raw.get("included", []):
-            if inc.get("type") == "Arrangement":
-                attrs = inc.get("attributes", {})
-                arrangements.append({
-                    "id": inc.get("id"),
-                    "name": attrs.get("name"),
-                    "bpm": attrs.get("bpm"),
-                    "meter": attrs.get("meter"),
-                    "default_key": attrs.get("default_key"),
-                    "notes": attrs.get("notes"),
-                })
-
-        return {
-            "id": sid,
-            "title": song_attrs.get("title"),
-            "author": song_attrs.get("author"),
-            "ccli_number": song_attrs.get("ccli_number"),
-            "copyright": song_attrs.get("copyright"),
-            "arrangements": arrangements,
-        }
+    return _dispatch(account, lambda name: _get_song_single(song_id, name))
 
 
 # ---------------------------------------------------------------------------
@@ -327,15 +472,18 @@ _RETRY_STATUSES = {429, 500, 502, 503, 504}
 # PCO allows 100 requests per 20s per app (x-pco-api-request-rate-*); stay under it.
 _MIN_REQUEST_INTERVAL = 0.25
 _LAST_REQUEST_AT = [0.0]
+# Serializes pacing across concurrent tool calls (and fan-out is sequential).
+_PACE_LOCK = threading.Lock()
 
 
 def _pace() -> None:
     """Space requests so a full history scan does not trip the account rate limit."""
-    now = time.monotonic()
-    wait = _MIN_REQUEST_INTERVAL - (now - _LAST_REQUEST_AT[0])
-    if wait > 0:
-        time.sleep(wait)
-    _LAST_REQUEST_AT[0] = time.monotonic()
+    with _PACE_LOCK:
+        now = time.monotonic()
+        wait = _MIN_REQUEST_INTERVAL - (now - _LAST_REQUEST_AT[0])
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_REQUEST_AT[0] = time.monotonic()
 
 
 def _get(
@@ -477,6 +625,8 @@ def _match_team_members(
                 "position": attrs.get("team_position_name"),
                 "status": status,
                 "status_label": STATUS_LABELS.get(status, status),
+                "decline_reason": attrs.get("decline_reason"),
+                "status_updated_at": attrs.get("status_updated_at"),
             })
     return matches
 
@@ -547,25 +697,208 @@ def _fetch_plan_songs(
     return songs
 
 
-def _require_known_account(account: str) -> None:
-    """Fail clearly for a bad account name instead of the credentials fallback."""
-    if os.environ.get("PCO_APP_ID") and (os.environ.get("PCO_SECRET") or os.environ.get("PCO_APP_SECRET")):
-        return
-    if not CREDS_FILE.is_file():
-        return
-    try:
-        names = list(json.loads(CREDS_FILE.read_text(encoding="utf-8")).keys())
-    except Exception:
-        return
-    if account not in names:
+def _person_song_history_single(
+    account: str,
+    name: str,
+    variants: set[str],
+    service_type_id: Optional[str],
+    limit: int,
+    max_plans: int,
+    include_declined: bool,
+) -> dict[str, Any]:
+    org = org_name(account)
+    client = get_client(account)
+    _RETRY_STATS.update({"requests": 0, "retries": 0, "rate_limited": 0})
+
+    # 1. Service types for this account (or the one requested).
+    service_types: list[dict[str, Any]] = []
+    if service_type_id:
+        resp = _get(client, f"/service_types/{service_type_id}")
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Service type {service_type_id} not found under account '{account}' "
+                f"({resp.status_code})"
+            )
+        st = resp.json().get("data", {})
+        service_types = [{
+            "id": str(st.get("id")),
+            "name": st.get("attributes", {}).get("name"),
+        }]
+    else:
+        try:
+            for st in _iter_pages(client, "/service_types"):
+                service_types.append({
+                    "id": str(st.get("id")),
+                    "name": st.get("attributes", {}).get("name"),
+                })
+        except RuntimeError as exc:
+            raise RuntimeError(f"Could not list service types: {exc}") from exc
+
+    if not service_types:
+        raise RuntimeError(f"No service types found under account '{account}'")
+
+    # 2. Resolve the person so plans are matched by id when possible.
+    people = _lookup_people(client, name)
+    person_id: Optional[str] = None
+    exact = [
+        p for p in (people or [])
+        if _normalize_person_name(p.get("name")) in variants
+    ]
+    if len(exact) > 1:
+        return {
+            "account": account,
+            "org_name": org,
+            "person_name": name,
+            "ambiguous": True,
+            "matched_plans": 0,
+            "returned_plans": 0,
+            "scan_complete": False,
+            "scanned_plans": 0,
+            "count": 0,
+            "candidates": exact,
+            "plans": [],
+            "note": "Multiple people match this name; narrow the name or use a person id.",
+        }
+    if len(exact) == 1:
+        person_id = exact[0]["id"]
+    elif people is not None:
+        # Name resolved to nothing: report near matches rather than guessing.
+        return {
+            "account": account,
+            "org_name": org,
+            "person_name": name,
+            "ambiguous": False,
+            "matched_plans": 0,
+            "returned_plans": 0,
+            "scan_complete": False,
+            "scanned_plans": 0,
+            "count": 0,
+            "candidates": people[:20],
+            "plans": [],
+            "note": "No exact person match for this account; candidates are near matches.",
+        }
+
+    # 3. Collect past plans, newest first.
+    stubs: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    failed_sts = 0
+    for st in service_types:
+        collected_for_st = 0
+        try:
+            for plan in _iter_pages(
+                client,
+                f"/service_types/{st['id']}/plans",
+                {"filter": "past", "order": "-sort_date"},
+            ):
+                attrs = plan.get("attributes", {})
+                stubs.append({
+                    "id": str(plan.get("id")),
+                    "service_type_id": st["id"],
+                    "service_type_name": st["name"],
+                    "title": attrs.get("title") or attrs.get("dates"),
+                    "dates": attrs.get("dates"),
+                    "sort_date": attrs.get("sort_date"),
+                })
+                collected_for_st += 1
+                if collected_for_st >= max_plans:
+                    break
+        except (RuntimeError, httpx.HTTPError) as exc:
+            failed_sts += 1
+            skipped.append(f"{st['name']} ({st['id']}): {exc}")
+
+    if not stubs and failed_sts == len(service_types):
         raise RuntimeError(
-            f"Unknown account '{account}'. Configured accounts: {', '.join(names)}"
+            "Could not read past plans for any service type: " + "; ".join(skipped)
         )
+
+    stubs.sort(key=lambda p: p.get("sort_date") or "", reverse=True)
+    stubs = stubs[:max_plans]
+
+    # 4. Walk newest-first, matching the person and collecting songs.
+    plans_out: list[dict[str, Any]] = []
+    scanned = 0
+    songs_total = 0
+    matched_plans = 0
+    scan_complete = True
+    for stub in stubs:
+        if songs_total >= limit:
+            scan_complete = False
+            break
+        scanned += 1
+        try:
+            matches = _match_team_members(
+                client, stub["service_type_id"], stub["id"], person_id, variants
+            )
+        except (RuntimeError, httpx.HTTPError) as exc:
+            skipped.append(f"plan {stub['id']}: {exc}")
+            continue
+        if not matches:
+            continue
+        if not include_declined:
+            matches = [m for m in matches if m.get("status") != "D"]
+            if not matches:
+                continue
+
+        matched_plans += 1
+
+        positions: list[str] = []
+        statuses: list[str] = []
+        for match in matches:
+            position = match.get("position")
+            if position and position not in positions:
+                positions.append(position)
+            status = match.get("status")
+            if status and status not in statuses:
+                statuses.append(status)
+
+        plan_songs: list[dict[str, Any]] = []
+        try:
+            plan_songs = _fetch_plan_songs(
+                client, stub["service_type_id"], stub["id"]
+            )
+        except (RuntimeError, httpx.HTTPError) as exc:
+            skipped.append(f"plan {stub['id']} items: {exc}")
+
+        remaining = limit - songs_total
+        plan_songs = plan_songs[:remaining]
+        songs_total += len(plan_songs)
+
+        plans_out.append({
+            "plan_id": stub["id"],
+            "date": stub["sort_date"],
+            "dates": stub["dates"],
+            "title": stub["title"],
+            "service_type_id": stub["service_type_id"],
+            "service_type_name": stub["service_type_name"],
+            "positions": positions,
+            "statuses": statuses,
+            "assignments": matches,
+            "songs": plan_songs,
+            "account": account,
+            "org_name": org,
+        })
+
+    return {
+        "account": account,
+        "org_name": org,
+        "person_name": name,
+        "person_id": person_id,
+        "matched_plans": matched_plans,
+        "returned_plans": len(plans_out),
+        "scan_complete": scan_complete,
+        "scanned_plans": scanned,
+        "count": songs_total,
+        "plans": plans_out,
+        "skipped": skipped,
+        "requests": _RETRY_STATS["requests"],
+        "retries": _RETRY_STATS["retries"],
+        "rate_limited": _RETRY_STATS["rate_limited"],
+    }
 
 
 @mcp.tool()
 def pco_person_song_history(
-    account: str = "unw",
+    account: Optional[str] = None,
     person_name: str = "",
     service_type_id: Optional[str] = None,
     limit: int = 15,
@@ -595,190 +928,13 @@ def pco_person_song_history(
     if max_plans < 1:
         raise ValueError("max_plans must be >= 1")
 
-    _require_known_account(account)
     variants = _person_name_variants(name)
-    _RETRY_STATS.update({"requests": 0, "retries": 0, "rate_limited": 0})
-
-    with make_client(account) as client:
-        # 1. Service types for this account (or the one requested).
-        service_types: list[dict[str, Any]] = []
-        if service_type_id:
-            resp = _get(client, f"/service_types/{service_type_id}")
-            if resp.status_code != 200:
-                raise RuntimeError(
-                    f"Service type {service_type_id} not found under account '{account}' "
-                    f"({resp.status_code})"
-                )
-            st = resp.json().get("data", {})
-            service_types = [{
-                "id": str(st.get("id")),
-                "name": st.get("attributes", {}).get("name"),
-            }]
-        else:
-            try:
-                for st in _iter_pages(client, "/service_types"):
-                    service_types.append({
-                        "id": str(st.get("id")),
-                        "name": st.get("attributes", {}).get("name"),
-                    })
-            except RuntimeError as exc:
-                raise RuntimeError(f"Could not list service types: {exc}") from exc
-
-        if not service_types:
-            raise RuntimeError(f"No service types found under account '{account}'")
-
-        # 2. Resolve the person so plans are matched by id when possible.
-        people = _lookup_people(client, name)
-        person_id: Optional[str] = None
-        exact = [
-            p for p in (people or [])
-            if _normalize_person_name(p.get("name")) in variants
-        ]
-        if len(exact) > 1:
-            return {
-                "account": account,
-                "person_name": name,
-                "ambiguous": True,
-                "matched_plans": 0,
-                "returned_plans": 0,
-                "scan_complete": False,
-                "scanned_plans": 0,
-                "count": 0,
-                "candidates": exact,
-                "plans": [],
-                "note": "Multiple people match this name; narrow the name or use a person id.",
-            }
-        if len(exact) == 1:
-            person_id = exact[0]["id"]
-        elif people is not None:
-            # Name resolved to nothing: report near matches rather than guessing.
-            return {
-                "account": account,
-                "person_name": name,
-                "ambiguous": False,
-                "matched_plans": 0,
-                "returned_plans": 0,
-                "scan_complete": False,
-                "scanned_plans": 0,
-                "count": 0,
-                "candidates": people[:20],
-                "plans": [],
-                "note": "No exact person match for this account; candidates are near matches.",
-            }
-
-        # 3. Collect past plans, newest first.
-        stubs: list[dict[str, Any]] = []
-        skipped: list[str] = []
-        failed_sts = 0
-        for st in service_types:
-            collected_for_st = 0
-            try:
-                for plan in _iter_pages(
-                    client,
-                    f"/service_types/{st['id']}/plans",
-                    {"filter": "past", "order": "-sort_date"},
-                ):
-                    attrs = plan.get("attributes", {})
-                    stubs.append({
-                        "id": str(plan.get("id")),
-                        "service_type_id": st["id"],
-                        "service_type_name": st["name"],
-                        "title": attrs.get("title") or attrs.get("dates"),
-                        "dates": attrs.get("dates"),
-                        "sort_date": attrs.get("sort_date"),
-                    })
-                    collected_for_st += 1
-                    if collected_for_st >= max_plans:
-                        break
-            except (RuntimeError, httpx.HTTPError) as exc:
-                failed_sts += 1
-                skipped.append(f"{st['name']} ({st['id']}): {exc}")
-
-        if not stubs and failed_sts == len(service_types):
-            raise RuntimeError(
-                "Could not read past plans for any service type: " + "; ".join(skipped)
-            )
-
-        stubs.sort(key=lambda p: p.get("sort_date") or "", reverse=True)
-        stubs = stubs[:max_plans]
-
-        # 4. Walk newest-first, matching the person and collecting songs.
-        plans_out: list[dict[str, Any]] = []
-        scanned = 0
-        songs_total = 0
-        matched_plans = 0
-        scan_complete = True
-        for stub in stubs:
-            if songs_total >= limit:
-                scan_complete = False
-                break
-            scanned += 1
-            try:
-                matches = _match_team_members(
-                    client, stub["service_type_id"], stub["id"], person_id, variants
-                )
-            except (RuntimeError, httpx.HTTPError) as exc:
-                skipped.append(f"plan {stub['id']}: {exc}")
-                continue
-            if not matches:
-                continue
-            if not include_declined:
-                matches = [m for m in matches if m.get("status") != "D"]
-                if not matches:
-                    continue
-
-            matched_plans += 1
-
-            positions: list[str] = []
-            statuses: list[str] = []
-            for match in matches:
-                position = match.get("position")
-                if position and position not in positions:
-                    positions.append(position)
-                status = match.get("status")
-                if status and status not in statuses:
-                    statuses.append(status)
-
-            plan_songs: list[dict[str, Any]] = []
-            try:
-                plan_songs = _fetch_plan_songs(
-                    client, stub["service_type_id"], stub["id"]
-                )
-            except (RuntimeError, httpx.HTTPError) as exc:
-                skipped.append(f"plan {stub['id']} items: {exc}")
-
-            remaining = limit - songs_total
-            plan_songs = plan_songs[:remaining]
-            songs_total += len(plan_songs)
-
-            plans_out.append({
-                "plan_id": stub["id"],
-                "date": stub["sort_date"],
-                "dates": stub["dates"],
-                "title": stub["title"],
-                "service_type_id": stub["service_type_id"],
-                "service_type_name": stub["service_type_name"],
-                "positions": positions,
-                "statuses": statuses,
-                "assignments": matches,
-                "songs": plan_songs,
-            })
-
-        return {
-            "account": account,
-            "person_name": name,
-            "person_id": person_id,
-            "matched_plans": matched_plans,
-            "returned_plans": len(plans_out),
-            "scan_complete": scan_complete,
-            "scanned_plans": scanned,
-            "count": songs_total,
-            "plans": plans_out,
-            "skipped": skipped,
-            "requests": _RETRY_STATS["requests"],
-            "retries": _RETRY_STATS["retries"],
-            "rate_limited": _RETRY_STATS["rate_limited"],
-        }
+    return _dispatch(
+        account,
+        lambda resolved: _person_song_history_single(
+            resolved, name, variants, service_type_id, limit, max_plans, include_declined
+        ),
+    )
 
 
 if __name__ == "__main__":
