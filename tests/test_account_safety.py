@@ -293,14 +293,14 @@ class ToolSurfaceAllowlistTests(unittest.TestCase):
 
 
 STRESS_ORGS = {
-    "unw": {
-        "id": "st-unw-stress",
+    "main": {
+        "id": "st-main-stress",
         "name": "Main Sunday Morning",
         "org": "Main Campus",
     },
-    "rs": {
-        "id": "st-rs-stress",
-        "name": "RS Saturday Evening",
+    "north": {
+        "id": "st-north-stress",
+        "name": "North Saturday Evening",
         "org": "North Campus",
     },
 }
@@ -334,13 +334,13 @@ class AccountSwitchingStressTests(ServerTestBase):
         self.write_creds(CREDS)
         clients = {
             account: FakeClient(single_service_type_handler(account))
-            for account in ("unw", "rs")
+            for account in ("main", "north")
         }
         self.use_clients(clients)
 
         for iteration in range(60):
-            requested = "unw" if iteration % 2 == 0 else "rs"
-            other = "rs" if requested == "unw" else "unw"
+            requested = "main" if iteration % 2 == 0 else "north"
+            other = "north" if requested == "main" else "main"
             expected = STRESS_ORGS[requested]
             other_calls_before = len(clients[other].calls)
 
@@ -363,8 +363,8 @@ class AccountSwitchingStressTests(ServerTestBase):
             self.assertEqual(row["id"], expected["id"])
             self.assertEqual(row["name"], expected["name"])
 
-        self.assertEqual(len(clients["unw"].calls), 30)
-        self.assertEqual(len(clients["rs"].calls), 30)
+        self.assertEqual(len(clients["main"].calls), 30)
+        self.assertEqual(len(clients["north"].calls), 30)
 
 
 class ChatSelectionOverrideTests(DualAccountMixin, ServerTestBase):
@@ -374,52 +374,52 @@ class ChatSelectionOverrideTests(DualAccountMixin, ServerTestBase):
         self.use_two_accounts()
 
     def test_selection_routes_omitted_explicit_wins_and_clear_restores_default(self):
-        used = server.pco_use_account("rs")
-        self.assertEqual(used["selected_account"], "rs")
+        used = server.pco_use_account("north")
+        self.assertEqual(used["selected_account"], "north")
         self.assertEqual(used["effective_source"], "chat")
 
         # 1. Omitted -> the chat selection.
         self.client_calls.clear()
         rows = server.pco_list_service_types()
-        self.assertEqual(self.client_calls, ["rs"])
+        self.assertEqual(self.client_calls, ["north"])
         self.assertEqual(
             {(row["account"], row["org_name"], row["account_source"]) for row in rows},
-            {("rs", "North Campus", "chat")},
+            {("north", "North Campus", "chat")},
         )
-        self.assertEqual(self.unw_client.calls, [])
+        self.assertEqual(self.main_client.calls, [])
 
         # 2. Explicit account= overrides the selection.
-        rs_calls_before = len(self.rs_client.calls)
+        north_calls_before = len(self.north_client.calls)
         self.client_calls.clear()
-        rows = server.pco_list_service_types(account="unw")
-        self.assertEqual(self.client_calls, ["unw"])
+        rows = server.pco_list_service_types(account="main")
+        self.assertEqual(self.client_calls, ["main"])
         self.assertEqual(
             {(row["account"], row["org_name"], row["account_source"]) for row in rows},
-            {("unw", "Main Campus", "explicit")},
+            {("main", "Main Campus", "explicit")},
         )
-        self.assertEqual(len(self.rs_client.calls), rs_calls_before)
-        self.assertEqual(pa.selected_account(), "rs")
+        self.assertEqual(len(self.north_client.calls), north_calls_before)
+        self.assertEqual(pa.selected_account(), "north")
 
         # 3. Omitted again -> still the chat selection.
         self.client_calls.clear()
         rows = server.pco_list_service_types()
-        self.assertEqual(self.client_calls, ["rs"])
-        self.assertEqual(rows[0]["account"], "rs")
+        self.assertEqual(self.client_calls, ["north"])
+        self.assertEqual(rows[0]["account"], "north")
         self.assertEqual(rows[0]["account_source"], "chat")
 
         # 4. Clearing the selection restores the installation default (first creds key).
         cleared = server.pco_use_account()
         self.assertIsNone(cleared["selected_account"])
         self.assertIsNone(pa.selected_account())
-        self.assertEqual(cleared["effective_account"], "unw")
+        self.assertEqual(cleared["effective_account"], "main")
         self.assertEqual(cleared["effective_source"], "installation")
 
         self.client_calls.clear()
         rows = server.pco_list_service_types()
-        self.assertEqual(self.client_calls, ["unw"])
+        self.assertEqual(self.client_calls, ["main"])
         self.assertEqual(
             {(row["account"], row["org_name"], row["account_source"]) for row in rows},
-            {("unw", "Main Campus", "installation")},
+            {("main", "Main Campus", "installation")},
         )
         self.assertFalse(self.config_path.exists())
 
@@ -429,14 +429,14 @@ class ConcurrentExplicitReadTests(DualAccountMixin, ServerTestBase):
         super().setUp()
         self.write_creds(CREDS)
         self.use_two_accounts()
-        server.pco_use_account("rs")
+        server.pco_use_account("north")
 
     def test_concurrent_explicit_reads_stay_on_their_own_account(self):
         orgs = {
-            "unw": ("Main Campus", "st-unw"),
-            "rs": ("North Campus", "st-rs"),
+            "main": ("Main Campus", "st-main"),
+            "north": ("North Campus", "st-north"),
         }
-        tasks = ["unw"] * 20 + ["rs"] * 20
+        tasks = ["main"] * 20 + ["north"] * 20
 
         def read(account: str):
             rows = server.pco_list_service_types(account=account)
@@ -457,9 +457,9 @@ class ConcurrentExplicitReadTests(DualAccountMixin, ServerTestBase):
             results = [future.result(timeout=60) for future in futures]
 
         self.assertEqual(results, tasks)
-        self.assertEqual(pa.selected_account(), "rs")
-        self.assertEqual(len(self.unw_client.calls), 20)
-        self.assertEqual(len(self.rs_client.calls), 20)
+        self.assertEqual(pa.selected_account(), "north")
+        self.assertEqual(len(self.main_client.calls), 20)
+        self.assertEqual(len(self.north_client.calls), 20)
 
 
 def upcoming_handler(account: str, service_type_id: str, service_type_name: str,
@@ -538,17 +538,17 @@ class UpcomingAggregationSafetyTests(ServerTestBase):
 
         self.write_creds(CREDS)
         specs = {
-            "unw": {
-                "service_type_id": "st-unw",
+            "main": {
+                "service_type_id": "st-main",
                 "service_type_name": "Main Sunday Morning",
-                "person_id": "person-unw",
+                "person_id": "person-main",
                 "org": "Main Campus",
                 "days_ahead": 3,
             },
-            "rs": {
-                "service_type_id": "st-rs",
-                "service_type_name": "RS Saturday Evening",
-                "person_id": "person-rs",
+            "north": {
+                "service_type_id": "st-north",
+                "service_type_name": "North Saturday Evening",
+                "person_id": "person-north",
                 "org": "North Campus",
                 "days_ahead": 4,
             },
@@ -578,7 +578,7 @@ class UpcomingAggregationSafetyTests(ServerTestBase):
 
         plans = envelope["plans"]
         self.assertEqual(len(plans), 2)
-        self.assertEqual({plan["account"] for plan in plans}, {"unw", "rs"})
+        self.assertEqual({plan["account"] for plan in plans}, {"main", "north"})
 
         for plan in plans:
             account = plan["account"]
@@ -591,7 +591,7 @@ class UpcomingAggregationSafetyTests(ServerTestBase):
 
         # The per-account envelopes must agree with the flattened list.
         by_account = {row["account"]: row for row in envelope["results"]}
-        self.assertEqual(set(by_account), {"unw", "rs"})
+        self.assertEqual(set(by_account), {"main", "north"})
         for account, row in by_account.items():
             spec = specs[account]
             self.assertEqual(row["org_name"], spec["org"])
@@ -604,7 +604,7 @@ class UpcomingAggregationSafetyTests(ServerTestBase):
         # No cross-account leak in either direction.
         self.assertEqual(
             {(plan["account"], plan["plan_id"]) for plan in plans},
-            {("unw", "plan-unw"), ("rs", "plan-rs")},
+            {("main", "plan-main"), ("north", "plan-north")},
         )
 
 

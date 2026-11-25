@@ -223,7 +223,7 @@ class SingleAccountUpcomingTests(ServerTestBase):
 
     def _serve(self, handler) -> FakeClient:
         client = FakeClient(handler)
-        self.use_clients({"unw": client})
+        self.use_clients({"main": client})
         return client
 
     def test_matches_exact_person_and_returns_windowed_plan_fields(self):
@@ -267,10 +267,10 @@ class SingleAccountUpcomingTests(ServerTestBase):
         ))
 
         result = server.pco_person_upcoming(
-            person_name="Alex Morgan", days=21, account="unw"
+            person_name="Alex Morgan", days=21, account="main"
         )
 
-        self.assertEqual(result["account"], "unw")
+        self.assertEqual(result["account"], "main")
         self.assertEqual(result["org_name"], "Main Campus")
         self.assertEqual(result["person_name"], "Alex Morgan")
         self.assertEqual(result["person_id"], "9")
@@ -310,7 +310,7 @@ class SingleAccountUpcomingTests(ServerTestBase):
         self.assertEqual(got["statuses"], ["C"])
         self.assertEqual(len(got["assignments"]), 1)
         self.assertEqual(got["assignments"][0]["status"], "C")
-        self.assertEqual(got["account"], "unw")
+        self.assertEqual(got["account"], "main")
         self.assertEqual(got["org_name"], "Main Campus")
 
         # FakeClient only defines get(); every recorded call is a relative GET.
@@ -345,7 +345,7 @@ class SingleAccountUpcomingTests(ServerTestBase):
             assignments=assignments,
         ))
 
-        default = server.pco_person_upcoming(person_name="Alex Morgan", account="unw")
+        default = server.pco_person_upcoming(person_name="Alex Morgan", account="main")
 
         self.assertEqual([p["plan_id"] for p in default["plans"]], ["11111"])
         self.assertEqual(default["matched_plans"], 1)
@@ -354,7 +354,7 @@ class SingleAccountUpcomingTests(ServerTestBase):
         self.assertEqual(default["plans"][0]["statuses"], ["C"])
 
         with_declined = server.pco_person_upcoming(
-            person_name="Alex Morgan", account="unw", include_declined=True
+            person_name="Alex Morgan", account="main", include_declined=True
         )
 
         self.assertEqual(
@@ -379,7 +379,7 @@ class SingleAccountUpcomingTests(ServerTestBase):
             },
         ))
 
-        result = server.pco_person_upcoming(person_name="Alex Morgan", account="unw")
+        result = server.pco_person_upcoming(person_name="Alex Morgan", account="main")
 
         self.assertTrue(result["ambiguous"])
         self.assertEqual(result["plans"], [])
@@ -401,7 +401,7 @@ class SingleAccountUpcomingTests(ServerTestBase):
             people_payload={"data": [_person("11", "Taylor Reed")]},
         ))
 
-        result = server.pco_person_upcoming(person_name="Alex Morgan", account="unw")
+        result = server.pco_person_upcoming(person_name="Alex Morgan", account="main")
 
         self.assertFalse(result["ambiguous"])
         self.assertEqual(result["plans"], [])
@@ -444,7 +444,7 @@ class SingleAccountUpcomingTests(ServerTestBase):
         ))
 
         result = server.pco_person_upcoming(
-            person_name="Alex Morgan", days=days, account="unw"
+            person_name="Alex Morgan", days=days, account="main"
         )
 
         self.assertEqual(
@@ -472,7 +472,7 @@ class SingleAccountUpcomingTests(ServerTestBase):
         ))
 
         result = server.pco_person_upcoming(
-            person_name="Alex Morgan", days=21, max_plans=2, account="unw"
+            person_name="Alex Morgan", days=21, max_plans=2, account="main"
         )
 
         self.assertEqual(len(result["plans"]), 2)
@@ -501,7 +501,7 @@ class SingleAccountUpcomingTests(ServerTestBase):
         # The 500 is retried with backoff; stub the sleeps so the test stays fast.
         with mock.patch.object(server.time, "sleep", return_value=None):
             result = server.pco_person_upcoming(
-                person_name="Alex Morgan", days=21, account="unw"
+                person_name="Alex Morgan", days=21, account="main"
             )
 
         self.assertEqual([p["plan_id"] for p in result["plans"]], ["92001"])
@@ -531,7 +531,7 @@ class SingleAccountUpcomingTests(ServerTestBase):
 
         with mock.patch.object(server.time, "sleep", return_value=None):
             result = server.pco_person_upcoming(
-                person_name="Alex Morgan", days=21, account="unw"
+                person_name="Alex Morgan", days=21, account="main"
             )
 
         self.assertEqual([p["plan_id"] for p in result["plans"]], ["92002"])
@@ -558,7 +558,7 @@ class SingleAccountUpcomingTests(ServerTestBase):
 
         with mock.patch.object(server.time, "sleep", return_value=None):
             result = server.pco_person_upcoming(
-                person_name="Alex Morgan", days=21, account="unw"
+                person_name="Alex Morgan", days=21, account="main"
             )
 
         self.assertEqual([p["plan_id"] for p in result["plans"]], ["92004"])
@@ -575,34 +575,34 @@ class FanOutUpcomingTests(ServerTestBase):
 
     def test_all_accounts_merges_and_sorts_plans(self):
         base = date.today()
-        unw_plans = [
-            _plan("10001", "st-unw", "Main Today", base.isoformat()),
+        main_plans = [
+            _plan("10001", "st-main", "Main Today", base.isoformat()),
             _plan(
                 "10002",
-                "st-unw",
+                "st-main",
                 "Main Later",
                 (base + timedelta(days=2)).isoformat(),
             ),
         ]
-        rs_plans = [
+        north_plans = [
             _plan(
                 "20001",
-                "st-rs",
-                "North Campus Sunday",
+                "st-north",
+                "North Sunday",
                 (base + timedelta(days=1)).isoformat(),
             )
         ]
-        unw_client = FakeClient(make_handler(
-            [_service_type("st-unw", "Main Sunday")],
-            unw_plans,
+        main_client = FakeClient(make_handler(
+            [_service_type("st-main", "Main Sunday")],
+            main_plans,
             people_payload=PEOPLE_PAYLOAD,
         ))
-        rs_client = FakeClient(make_handler(
-            [_service_type("st-rs", "North Campus Sunday")],
-            rs_plans,
+        north_client = FakeClient(make_handler(
+            [_service_type("st-north", "North Sunday")],
+            north_plans,
             people_payload=PEOPLE_PAYLOAD,
         ))
-        self.use_clients({"unw": unw_client, "rs": rs_client})
+        self.use_clients({"main": main_client, "north": north_client})
 
         envelope = server.pco_person_upcoming(
             person_name="Alex Morgan", days=21, account="all"
@@ -612,11 +612,11 @@ class FanOutUpcomingTests(ServerTestBase):
         self.assertEqual(envelope["account_source"], "all")
         self.assertEqual(envelope["errors"], [])
         self.assertEqual(
-            {row["account"] for row in envelope["results"]}, {"unw", "rs"}
+            {row["account"] for row in envelope["results"]}, {"main", "north"}
         )
         self.assertEqual(
             {row["account"]: row["org_name"] for row in envelope["results"]},
-            {"unw": "Main Campus", "rs": "North Campus"},
+            {"main": "Main Campus", "north": "North Campus"},
         )
 
         plans = envelope["plans"]
@@ -627,9 +627,9 @@ class FanOutUpcomingTests(ServerTestBase):
         self.assertEqual(envelope["count"], 3)
 
         expected = {
-            "10001": ("unw", "Main Campus", "Main Sunday"),
-            "10002": ("unw", "Main Campus", "Main Sunday"),
-            "20001": ("rs", "North Campus", "North Campus Sunday"),
+            "10001": ("main", "Main Campus", "Main Sunday"),
+            "10002": ("main", "Main Campus", "Main Sunday"),
+            "20001": ("north", "North Campus", "North Sunday"),
         }
         for plan in plans:
             account, org, st_name = expected[plan["plan_id"]]
@@ -646,21 +646,21 @@ class FanOutUpcomingTests(ServerTestBase):
 
     def test_partial_failure_keeps_successes_and_records_error(self):
         base = date.today()
-        unw_plans = [
+        main_plans = [
             _plan(
                 "10001",
-                "st-unw",
+                "st-main",
                 "Main Sunday",
                 (base + timedelta(days=1)).isoformat(),
             )
         ]
         self.use_clients({
-            "unw": FakeClient(make_handler(
-                [_service_type("st-unw", "Main Sunday")],
-                unw_plans,
+            "main": FakeClient(make_handler(
+                [_service_type("st-main", "Main Sunday")],
+                main_plans,
                 people_payload=PEOPLE_PAYLOAD,
             )),
-            "rs": pa.AccountError("401 unauthorized for rs"),
+            "north": pa.AccountError("401 unauthorized for north"),
         })
 
         envelope = server.pco_person_upcoming(
@@ -669,14 +669,14 @@ class FanOutUpcomingTests(ServerTestBase):
 
         self.assertEqual(envelope["account"], "all")
         self.assertEqual(envelope["account_source"], "all")
-        self.assertEqual([row["account"] for row in envelope["results"]], ["unw"])
+        self.assertEqual([row["account"] for row in envelope["results"]], ["main"])
         self.assertEqual([p["plan_id"] for p in envelope["plans"]], ["10001"])
-        self.assertEqual(envelope["plans"][0]["account"], "unw")
+        self.assertEqual(envelope["plans"][0]["account"], "main")
         self.assertEqual(envelope["count"], 1)
 
         self.assertEqual(len(envelope["errors"]), 1)
         error = envelope["errors"][0]
-        self.assertEqual(error["account"], "rs")
+        self.assertEqual(error["account"], "north")
         self.assertEqual(error["org_name"], "North Campus")
         self.assertIn("401", str(error["error"]))
 
@@ -697,7 +697,7 @@ class ValidationUpcomingTests(ServerTestBase):
             [_plan("11111", "st-sun", "Sunday Gathering", date.today().isoformat())],
             people_payload=PEOPLE_PAYLOAD,
         ))
-        self.use_clients({"unw": self.client})
+        self.use_clients({"main": self.client})
 
     def test_invalid_arguments_raise_value_error_before_any_request(self):
         cases = [
@@ -711,7 +711,7 @@ class ValidationUpcomingTests(ServerTestBase):
         for kwargs in cases:
             with self.subTest(**kwargs):
                 with self.assertRaises(ValueError):
-                    server.pco_person_upcoming(account="unw", **kwargs)
+                    server.pco_person_upcoming(account="main", **kwargs)
 
         self.assertEqual(self.client.calls, [])
 

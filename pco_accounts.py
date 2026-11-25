@@ -26,7 +26,7 @@ CONFIG_FILE = Path(os.path.expanduser("~/.mpco_config.json"))
 ENV_ACCOUNT_NAME = "env"
 ALL = "all"
 
-DEFAULT_ACCOUNT_FALLBACK = "unw"
+DEFAULT_ACCOUNT_FALLBACK = "main"
 _JSON_RETRY_DELAY = 0.05
 
 
@@ -358,7 +358,7 @@ def _validated_default(name: str, valid: list[str], source: str) -> str:
         return name
     if not _load_creds() and _env_creds() is not None:
         # Legacy env-only setup: the env credentials serve any requested name,
-        # so an explicit default such as "unw" is still routable.
+        # so an explicit default such as "main" is still routable.
         return name
     if valid:
         raise _unknown_account(name, valid)
