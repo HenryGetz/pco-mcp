@@ -621,4 +621,6 @@ Expect only `.env.example`/`README.md` documentation hits for `pco_pat_`, and no
 
 ## License
 
-Private repository; no license granted. The Planning Center API is used under its own terms.
+Public repository. No license has been granted yet, so the code remains all rights
+reserved; add a license (for example MIT or Apache-2.0) if you want others to reuse or
+redistribute it. The Planning Center API is used under its own terms.
