@@ -222,12 +222,15 @@ provide a legacy env-only credential pair, exposed as a synthetic account named
 
 ## Manual installation and update
 
+The [README install prompt](../README.md#install) is the easiest path and lets a
+coding agent handle these steps. Use this section if you prefer a terminal.
+
 Requirements: Python 3.12+ and a Planning Center Personal Access Token
 (`appId` + secret). The token needs **write permission** for the write tools; a
 read-only token previews fine but any `confirm=True` call fails with `403`.
 
 ```bash
-git clone <repo-url> pco-mcp
+git clone https://github.com/HenryGetz/pco-mcp.git pco-mcp
 cd pco-mcp
 python3 -m venv venv          # or: uv venv venv
 ./venv/bin/pip install -r requirements.txt

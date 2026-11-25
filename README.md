@@ -1,128 +1,70 @@
-# pco-mcp: an AI assistant for Planning Center Services
+# pco-mcp
 
-**Your Planning Center plans, setlists, and song library, answerable in plain English.**
+**An AI secretary for Planning Center Services.**
 
-pco-mcp connects a Planning Center Services organization to any MCP-capable AI app — Claude Desktop, Cursor, Codex, omp, and others. MCP is the standard those apps use to talk to outside tools, so the same server works everywhere. You set it up once with a Planning Center Personal Access Token; after that, you just ask.
+pco-mcp connects your Planning Center plans, setlists, songs, and schedule to an AI app that supports MCP. Ask in plain English — no code.
 
-## What you can ask
+Works with Claude Desktop, Claude Code, Cursor, Codex, omp, and any other MCP-capable client.
 
-- "What services are coming up at Main Campus next month?"
-- "Show me the setlist and keys for this Sunday."
+## Install
+
+Copy this prompt into your coding agent:
+
+```text
+Install and configure pco-mcp for me from https://github.com/HenryGetz/pco-mcp.
+
+1. Clone or update the repo in a sensible local folder.
+2. Create a Python 3.12+ virtual environment, install requirements.txt, and run
+   venv/bin/python -c "import server; print(server.mcp.name)" (on Windows, use
+   venv\Scripts\python.exe).
+3. Ask me for an account nickname (default: main), an organization display name,
+   and my Planning Center app ID and app secret. I create Personal Access Tokens at
+   https://api.planningcenteronline.com/oauth/applications. Write them to
+   ~/.mpco_credentials.json as
+   {"<nickname>": {"appId": "...", "appSecret": "...", "orgName": "..."}}
+   with mode 600, preserve any accounts already in that file, and never print,
+   echo, commit, or put the secret in the repo.
+4. Detect the AI app I am using (Claude Desktop, Claude Code, Cursor, Codex, omp,
+   or another MCP client) and add a stdio MCP server named pco using the absolute
+   venv Python and server.py paths. If you cannot safely edit its config, print
+   the exact config and tell me where to paste it.
+5. Tell me to restart the app, then verify with pco_list_accounts and
+   pco_list_service_types. Report the install path, account names, and exact
+   restart step.
+6. Do not create, edit, or delete anything in Planning Center during setup. Reads only.
+
+If a step fails, stop and tell me exactly what is missing.
+```
+
+The agent handles the Python environment, your MCP client config, and the Planning Center token. If it cannot edit your app's config, it will print the exact JSON/TOML for you.
+
+A read-only token is enough for questions. Add write permission if you want the assistant to change plans and service times. The Planning Center API is used under its own terms.
+
+## Try asking
+
+- "What services are coming up at Main Campus?"
+- "Show me the setlist and keys for Sunday."
 - "What songs has Alex Morgan played, and in what keys?"
-- "Is Alex Morgan serving anywhere in the next three weeks?"
-- "Find 'Great Are You Lord' in our song library and show me its arrangements."
+- "Is Alex Morgan serving in the next three weeks?"
+- "Add a rehearsal to the Christmas Eve plan at 6:30 PM — preview it first."
 - "Across all campuses, what plans are scheduled for December?"
-- "Add a rehearsal to the Christmas Eve plan from 6:30 to 8:00 PM — preview it first."
-- "Move the second service time back 30 minutes — show me the change before you make it."
 
-Answers come from your actual Planning Center data. When a person's name is ambiguous or a plan cannot be found, the server returns candidates or an error instead of guessing.
+## What it does
 
-## Install in one line
+- Reads service types, plans, setlists, songs, arrangements, keys, people's song history, and upcoming assignments.
+- Reads across multiple Planning Center organizations in one call.
+- Writes plans, plan items, and plan times.
+- Writes are preview-first: show the exact change, send nothing until you confirm, and never retry automatically. Deletes require an exact title/date/time guard.
 
-macOS / Linux:
+## Safety
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/HenryGetz/pco-mcp/main/install.sh | bash
-```
+- Credentials stay in `~/.mpco_credentials.json`, never in the repo.
+- Reads are GET-only.
+- If a write times out, check Planning Center before repeating it.
 
-Windows (PowerShell):
+## Docs and license
 
-```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/HenryGetz/pco-mcp/main/install.ps1 | iex"
-```
-
-1. **Run the installer** for your system. It creates the install folder, a Python environment, and the server, then prints the exact Python and `server.py` paths you need below.
-2. **Create a Personal Access Token** in Planning Center at <https://api.planningcenteronline.com/oauth/applications> and paste the app ID and secret when the installer asks. The token needs **write** permission if you want the assistant to change plans; read-only is enough for questions. Credentials are saved to `~/.mpco_credentials.json`, outside the repo.
-3. **Connect your AI app** with the configuration in the next section, then restart the app completely — quit it, don't just close the window.
-
-## Connect your AI app
-
-pco-mcp is a standard **stdio MCP server**. Add this entry to your app's MCP settings:
-
-```json
-{
-  "mcpServers": {
-    "pco": {
-      "command": "<install-dir>/venv/bin/python",
-      "args": ["<install-dir>/server.py"]
-    }
-  }
-}
-```
-
-Replace `<install-dir>` with the path the installer printed. No token or secret goes in this file — the server reads `~/.mpco_credentials.json` itself. On Windows the interpreter path is `<install-dir>\venv\Scripts\python.exe`.
-
-| App | Where the entry goes |
-|---|---|
-| **Any MCP client** | Its "add MCP server" or stdio server setting; use the JSON shape above. |
-| **Claude Desktop** | `claude_desktop_config.json` — macOS `~/Library/Application Support/Claude/`, Windows `%APPDATA%\Claude\`. |
-| **Cursor** | `~/.cursor/mcp.json`, or `.cursor/mcp.json` in a project. |
-| **Codex** | `~/.codex/config.toml`, in an `[mcp_servers.pco]` table with `command` and `args`. |
-| **omp** | `~/.omp/agent/mcp.json`, under `mcpServers`. |
-
-App-specific paths and formats above are examples; use your app's MCP settings. If your app has an "Add MCP server" screen, prefer it and paste the command and argument paths there.
-
-## What it can do
-
-**Reads** (always safe):
-
-- List service types and upcoming or past plans.
-- Open a full plan: item order, songs, arrangements, keys, BPM, meter, notes, attachments, and service or rehearsal times.
-- Search the song library and show a song's arrangements and default keys.
-- Show a person's song history, with the key each song was in.
-- Show a person's upcoming assignments for the next N days, with positions and confirmation status.
-- List the Planning Center organizations you have connected.
-
-**Controlled writes** (preview first):
-
-- Create, update, or delete plans.
-- Create, update, or delete plan items, including songs and section headers.
-- Create, update, or delete plan times (service, rehearsal, or other).
-
-By default, every write starts as a **preview**: the assistant shows the exact request and payload, and nothing changes until you tell it to go ahead. A confirmed call sends exactly one request. The token needs write permission for any confirmed write; a read-only token can still preview.
-
-## Multiple campuses
-
-Each Planning Center organization gets its own account nickname and Personal Access Token. Reads can span every connected account in one tool call — ask "list December plans across all accounts" and the server fans out. Writes always name one account, so a change cannot land on the wrong campus.
-
-The installer creates your first entry. To add a second organization, add another top-level entry to `~/.mpco_credentials.json`:
-
-```json
-{
-  "main":  { "appId": "…", "appSecret": "pco_pat_…", "orgName": "Main Campus" },
-  "north": { "appId": "…", "appSecret": "pco_pat_…", "orgName": "North Campus" }
-}
-```
-
-The nicknames are yours to choose. Ask "what accounts are connected?" to see the exact names. See [advanced configuration](docs/ADVANCED.md) for adding organizations, choosing a default, and account routing.
-
-## Safety and privacy
-
-- Credentials live only in `~/.mpco_credentials.json`, outside the repository, and are never printed by the tools.
-- Reads are `GET`-only; they change nothing.
-- Writes are preview-by-default. A confirmed write sends one request and is **never retried automatically**.
-- Deletes require an exact guard — a plan title and/or date, an item title, or a plan-time start — and refuse if the current record does not match.
-- If a write times out or hits a server error, the outcome may be unknown. Check the plan in Planning Center before trying again so you do not create a duplicate.
-- Every write must name one organization explicitly.
-
-## Troubleshooting
-
-- **The AI doesn't see the pco tools.** Restart the app fully after saving its MCP settings, then start a new chat. Some apps also have an enable or approve toggle for each server.
-- **The server won't start.** Use the exact Python path the installer printed (`<install-dir>/venv/bin/python`), not your system Python. If the install folder moved, update the path or re-run the installer.
-- **A confirmed change fails with 403.** The token is read-only. Create a new token with write permission and replace it in `~/.mpco_credentials.json`.
-- **"Account not found."** Ask "list my Planning Center accounts"; the names are the top-level keys in `~/.mpco_credentials.json`. Writes need one of those names, not "all".
-- **Where settings and logs live.** Credentials: `~/.mpco_credentials.json`. Non-secret preferences: `~/.mpco_config.json`. The server writes no log file of its own; startup errors and request output appear in your AI app's MCP or server log, or in the terminal that launched it.
-
-## Learn more
-
-- [Tool reference](docs/REFERENCE.md) — every tool, argument, and return shape.
-- [Advanced configuration](docs/ADVANCED.md) — multiple organizations, defaults, and routing.
-- Developers: after installing, run the test suite with
-
-  ```bash
-  cd <install-dir>
-  ./venv/bin/python -m unittest discover -s tests -t . -v
-  ```
-
-- Source: <https://github.com/HenryGetz/pco-mcp>
-- License: no license has been granted yet; the code is all rights reserved. The Planning Center API is used under its own terms.
+- [Tool reference](docs/REFERENCE.md)
+- [Advanced setup and troubleshooting](docs/ADVANCED.md)
+- [Manual installation](docs/ADVANCED.md#manual-installation-and-update)
+- [MIT License](LICENSE)
