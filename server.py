@@ -4,8 +4,16 @@
 Integrates with Planning Center Services API (v2) using credentials from
 ~/.mpco_credentials.json or environment variables.
 
-Every tool that talks to PCO takes ``account``: omitted uses the configured
-default account, ``"all"`` fans out over every configured account.
+Every tool that talks to PCO takes ``account``. Routing precedence per call:
+
+1. explicit ``account=`` (a name, or ``"all"``) always wins;
+2. this chat's selection (``pco_use_account``), keyed to the stable lazy-tool
+   process when running under lazy-tool, else kept in this server process;
+3. the installation default snapshot (env/config/first key), cached per process.
+
+``"all"`` fans out over every configured account. Selections never cross chats;
+``pco_set_default_account(..., persist=True)`` is the only call that writes the
+config file, and it affects new chats only.
 """
 
 from __future__ import annotations
@@ -15,6 +23,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from typing import Any, Callable, Optional
 
 import httpx
@@ -29,18 +38,25 @@ if _REPO_DIR not in sys.path:
 from pco_accounts import (
     AccountError,
     account_meta,
+    chat_scope_id,
     credentials,
-    default_account,
     fan_out,
     get_client,
+    installation_default,
     is_all,
     list_accounts,
     org_name,
     resolve_accounts,
+    select_account,
+    selected_account,
     set_default_account,
 )
 
 mcp = FastMCP("planning-center")
+
+# One value per server process: chats get their own process (and thus their own
+# account selection), so this identifies the scope of pco_use_account.
+INSTANCE_ID = uuid.uuid4().hex[:12]
 
 
 def extract_plan_id(plan_id_or_url: str | int) -> str:
@@ -53,11 +69,48 @@ def extract_plan_id(plan_id_or_url: str | int) -> str:
     raise ValueError(f"Could not extract numeric plan ID from '{plan_id_or_url}'")
 
 
+def _tag_account_source(result: Any, source: str) -> Any:
+    """Label where the routed account came from: dict result, or every list row."""
+    if isinstance(result, dict):
+        result["account_source"] = source
+    elif isinstance(result, list):
+        for row in result:
+            if isinstance(row, dict):
+                row["account_source"] = source
+    return result
+
+
 def _dispatch(account: Optional[str], call: Callable[[str], Any]) -> Any:
-    """Run ``call`` for the resolved account, or fan out over every account for "all"."""
+    """Run ``call`` for the routed account, or fan out over every account for "all".
+
+    Precedence: explicit ``account`` argument -> this chat's selection
+    (``pco_use_account``) -> the installation default snapshot. The chosen source
+    is tagged on the result as ``account_source``.
+    """
     if is_all(account):
-        return fan_out(resolve_accounts(account), call)
-    return call(resolve_accounts(account)[0])
+        envelope = fan_out(resolve_accounts(account), call)
+        envelope["account_source"] = "all"
+        return envelope
+
+    if account is not None and (not isinstance(account, str) or account.strip()):
+        return _tag_account_source(call(resolve_accounts(account)[0]), "explicit")
+
+    selected = selected_account()
+    if selected is not None:
+        try:
+            credentials(selected)
+            name = resolve_accounts(selected)[0]
+        except AccountError as exc:
+            valid = list_accounts()
+            raise AccountError(
+                f"This chat's selected PCO account '{selected}' is no longer usable: {exc} "
+                f"Call pco_use_account() with one of {valid or 'the configured accounts'} "
+                "to pick another account, or call pco_use_account() with no argument to "
+                "clear the selection and use the installation default."
+            ) from exc
+        return _tag_account_source(call(name), "chat")
+
+    return _tag_account_source(call(installation_default()[0]), "installation")
 
 
 def _has_credentials(account: str) -> bool:
@@ -72,16 +125,22 @@ def _has_credentials(account: str) -> bool:
 def pco_list_accounts(detailed: bool = False) -> list[str] | list[dict[str, Any]]:
     """List configured Planning Center account names.
 
-    detailed=True adds org_name, default flag, and credential presence per account.
+    detailed=True adds org_name, has_credentials, and per-row flags: `default`
+    (the installation default snapshot this process routes to), `selected`
+    (this chat's pco_use_account selection), and `effective` (what omitted
+    account= calls actually use: the selection when set, else the snapshot).
     """
     names = list_accounts()
     if not detailed:
         return list(names)
 
     try:
-        current_default: Optional[str] = default_account()
+        snapshot: Optional[str] = installation_default()[0]
     except AccountError:
-        current_default = None
+        # A broken installation default must not make the listing unusable.
+        snapshot = None
+    selected = selected_account()
+    effective = selected if selected is not None else snapshot
 
     out: list[dict[str, Any]] = []
     for name in names:
@@ -89,26 +148,148 @@ def pco_list_accounts(detailed: bool = False) -> list[str] | list[dict[str, Any]
         out.append({
             "account": meta["account"],
             "org_name": meta["org_name"],
-            "default": name == current_default,
+            "default": name == snapshot,
+            "selected": name == selected,
+            "effective": name == effective,
             "has_credentials": _has_credentials(name),
         })
     return out
 
 
 @mcp.tool()
-def pco_set_default_account(account: str) -> dict[str, Any]:
-    """Persist the account used when a tool call omits `account`. Rejects "all"."""
+def pco_account_status() -> dict[str, Any]:
+    """Report this chat's PCO account routing. No network calls.
+
+    scope_id identifies the stable chat (the lazy-tool process) when running
+    under lazy-tool; pid and instance_id identify the current pco process, which
+    lazy-tool may replace on every call. installation_default is the process
+    snapshot (not a fresh config read), so it matches what omitted account=
+    calls route to. The effective account is this chat's selection when set,
+    else that snapshot. routing_warning is set when no accounts are configured,
+    when several accounts exist with no selection, or when the saved selection
+    is no longer usable.
+    """
+    names = list_accounts()
+    selected = selected_account()
+    scope_id = chat_scope_id()
+
+    try:
+        inst_name, inst_source = installation_default()
+    except AccountError as exc:
+        if selected is None:
+            raise AccountError(
+                f"The installation default PCO account cannot be resolved: {exc} "
+                "Fix PCO_DEFAULT_ACCOUNT or ~/.mpco_config.json, or call "
+                "pco_use_account(<name>) to route this chat to a configured account."
+            ) from exc
+        inst_name, inst_source = None, None
+
+    effective = selected if selected is not None else inst_name
+
+    warning: Optional[str] = None
+    if not names:
+        warning = (
+            "No PCO accounts are configured. Add an entry to ~/.mpco_credentials.json "
+            "or set PCO_APP_ID and PCO_SECRET before calling a PCO tool."
+        )
+    elif selected is not None:
+        if not _has_credentials(selected):
+            warning = (
+                f"This chat's selected account '{selected}' is no longer configured "
+                "or has unusable credentials; tool calls that omit account= will fail "
+                "until you call pco_use_account(<name>) or pco_use_account() to clear "
+                "the selection."
+            )
+    elif len(names) > 1:
+        warning = (
+            f"{len(names)} PCO accounts are configured and this chat has no selection; "
+            f"omitted account= calls route to the installation default '{inst_name}'. "
+            "Call pco_use_account(<name>) to pin this chat to another org."
+        )
+
+    accounts: list[dict[str, Any]] = []
+    for name in names:
+        meta = account_meta(name)
+        accounts.append({
+            "account": meta["account"],
+            "org_name": meta["org_name"],
+            "default": name == inst_name,
+            "selected": name == selected,
+            "effective": name == effective,
+            "has_credentials": _has_credentials(name),
+        })
+
+    return {
+        "instance_id": INSTANCE_ID,
+        "pid": os.getpid(),
+        "scope": "chat" if scope_id is not None else "process",
+        "scope_id": scope_id,
+        "installation_default": inst_name,
+        "installation_default_source": inst_source,
+        "selected_account": selected,
+        "effective_account": effective,
+        "effective_source": "chat" if selected is not None else "installation",
+        "routing_warning": warning,
+        "accounts": accounts,
+    }
+
+
+@mcp.tool()
+def pco_use_account(account: Optional[str] = None) -> dict[str, Any]:
+    """Select the account for THIS chat only. Never writes config or credentials.
+
+    Under lazy-tool the selection is stored in a small non-secret per-chat
+    runtime file keyed to this chat's stable lazy-tool process, because
+    lazy-tool may start a fresh pco child per call. It does not affect other
+    chats. Omitted (or empty) argument clears the selection, so omitted
+    account= calls fall back to the installation default. An explicit account=
+    on any tool always wins. Returns pco_account_status() plus changed/message.
+    """
+    before = selected_account()
+    after = select_account(account)
+    status = pco_account_status()
+    changed = before != after
+    if after is None:
+        message = (
+            "Cleared this chat's account selection; omitted account= calls now route "
+            f"to the installation default '{status['effective_account']}'."
+        )
+    else:
+        message = (
+            f"This chat now routes omitted account= calls to '{after}' "
+            f"({status['effective_source']}). An explicit account= still overrides it."
+        )
+    return {**status, "changed": changed, "message": message}
+
+
+@mcp.tool()
+def pco_set_default_account(account: str, persist: bool = False) -> dict[str, Any]:
+    """Set the account for this chat. No config write unless persist=True.
+
+    The account is validated and selected for THIS chat immediately. Without
+    persist, only this chat's non-secret runtime selection changes. persist=True
+    also writes ~/.mpco_config.json, which affects only NEW chats: running chats
+    keep their installation snapshot and any per-chat selection. Rejects "all".
+    """
     name = (account or "").strip()
     if not name:
         raise ValueError("account is required")
     if is_all(name):
         raise ValueError("Cannot set 'all' as the default account")
     resolve_accounts(name)  # validates the name against configured accounts
-    config_file = set_default_account(name)
+    credentials(name)  # validates that the account is usable
+
+    config_file: Optional[str] = None
+    if persist:
+        config_file = set_default_account(name)
+    select_account(name)
+
     return {
         "default_account": name,
+        "scope": "persisted" if persist else "chat",
         "config_file": config_file,
         "accounts": list_accounts(),
+        "status": pco_account_status(),
     }
 
 
@@ -132,7 +313,12 @@ def _list_service_types_single(account: str) -> list[dict[str, Any]]:
 
 @mcp.tool()
 def pco_list_service_types(account: Optional[str] = None) -> list[dict[str, Any]] | dict[str, Any]:
-    """List all service types (e.g. Sunday Morning, Youth, Chapels) for the specified account."""
+    """List all service types (e.g. Sunday Morning, Youth, Chapels) per account.
+
+    Account routing: omitted `account` uses this chat's selection
+    (`pco_use_account`), else the installation default; an explicit name always
+    overrides; `"all"` fans out over every configured org.
+    """
     return _dispatch(account, _list_service_types_single)
 
 
@@ -195,7 +381,10 @@ def pco_list_plans(
 ) -> list[dict[str, Any]] | dict[str, Any]:
     """List plans for a service type (or across service types if service_type_id is omitted).
 
-    filter can be 'future', 'past', or 'all'.
+    filter can be 'future', 'past', or 'all'. Account routing: omitted `account`
+    uses this chat's selection (`pco_use_account`), else the installation
+    default; an explicit name always overrides; `"all"` fans out over every
+    configured org.
     """
     return _dispatch(
         account,
@@ -372,7 +561,13 @@ def pco_get_plan(
     account: Optional[str] = None,
     include_attachments: bool = True,
 ) -> dict[str, Any]:
-    """Retrieve full plan details, setlist order, songs, arrangements, keys, notes, and attachments from a plan ID or URL."""
+    """Retrieve full plan details, setlist order, songs, arrangements, keys, notes, and attachments from a plan ID or URL.
+
+    Account routing: omitted `account` uses this chat's selection
+    (`pco_use_account`), else the installation default; an explicit name always
+    overrides; `"all"` fans out over every configured org (envelope result with
+    account_source="all" and an ambiguous flag).
+    """
     plan_id = extract_plan_id(plan_id_or_url)
     if is_all(account):
         envelope = fan_out(
@@ -380,8 +575,12 @@ def pco_get_plan(
             lambda name: _get_plan_single(plan_id, name, include_attachments),
         )
         envelope["ambiguous"] = len(envelope["results"]) > 1
+        envelope["account_source"] = "all"
         return envelope
-    return _get_plan_single(plan_id, resolve_accounts(account)[0], include_attachments)
+    return _dispatch(
+        account,
+        lambda name: _get_plan_single(plan_id, name, include_attachments),
+    )
 
 
 def _search_songs_single(query: str, per_page: int, account: str) -> list[dict[str, Any]]:
@@ -413,7 +612,12 @@ def pco_search_songs(
     per_page: int = 10,
     account: Optional[str] = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
-    """Search for songs in the Planning Center library by title or keyword."""
+    """Search for songs in the Planning Center library by title or keyword.
+
+    Account routing: omitted `account` uses this chat's selection
+    (`pco_use_account`), else the installation default; an explicit name always
+    overrides; `"all"` fans out over every configured org.
+    """
     return _dispatch(account, lambda name: _search_songs_single(query, per_page, name))
 
 
@@ -456,7 +660,12 @@ def pco_get_song(
     song_id: str | int,
     account: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Retrieve details for a specific song including all arrangements, keys, and metadata."""
+    """Retrieve details for a specific song including all arrangements, keys, and metadata.
+
+    Account routing: omitted `account` uses this chat's selection
+    (`pco_use_account`), else the installation default; an explicit name always
+    overrides; `"all"` fans out over every configured org.
+    """
     return _dispatch(account, lambda name: _get_song_single(song_id, name))
 
 
@@ -919,6 +1128,10 @@ def pco_person_song_history(
     plans. Assignments the person declined (status D) are skipped unless
     include_declined=True. Returns candidates instead of guessing when the name
     matches more than one person.
+
+    Account routing: omitted `account` uses this chat's selection
+    (`pco_use_account`), else the installation default; an explicit name always
+    overrides; `"all"` fans out over every configured org.
     """
     name = (person_name or "").strip()
     if not name:

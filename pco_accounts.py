@@ -46,6 +46,19 @@ _creds_cache: tuple[tuple[int, int] | None, dict[str, Any]] | None = None
 _clients_lock = threading.Lock()
 _clients: dict[tuple[str, str, str], httpx.Client] = {}
 
+# Process-local chat state: the selected account and the installation default
+# snapshot. A selection also goes to a tiny per-chat runtime file when the server
+# runs under lazy-tool, because lazy-tool may start a fresh pco child per call.
+_process_lock = threading.Lock()
+_selected_account: str | None = None
+_installation_default: tuple[str, str] | None = None
+
+# Stable chat scope: the nearest ancestor lazy-tool process. Cached because the
+# process tree does not change for the life of this server process.
+_scope_lock = threading.Lock()
+_chat_scope_checked = False
+_chat_scope_cache: tuple[int, int] | None = None
+
 
 # --------------------------------------------------------------------------- #
 # Small helpers
@@ -66,6 +79,142 @@ def _require_name(account: Any) -> str:
     if name is None:
         raise AccountError("Account name must be a non-empty string.")
     return name
+
+
+def _proc_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+
+
+def _proc_starttime(pid: int) -> int | None:
+    """Linux /proc/<pid>/stat field 22, used to distinguish a reused PID."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        return int(stat.rsplit(")", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _proc_ppid(pid: int) -> int | None:
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("PPid:"):
+                return int(line.split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+    return None
+
+
+def _chat_scope() -> tuple[int, int] | None:
+    """Return (pid, starttime) of the nearest ancestor `lazy-tool ... serve`.
+
+    lazy-tool may spawn a fresh pco child per tool call, so the pco process is
+    not a stable chat identity. Its lazy-tool parent is. None outside lazy-tool
+    (direct stdio), where the server process itself is the scope.
+    """
+    global _chat_scope_checked, _chat_scope_cache
+    with _scope_lock:
+        if _chat_scope_checked:
+            return _chat_scope_cache
+        _chat_scope_checked = True
+        pid = os.getppid()
+        for _ in range(10):
+            if pid <= 1:
+                break
+            cmdline = _proc_cmdline(pid)
+            if "lazy-tool" in cmdline and "serve" in cmdline:
+                starttime = _proc_starttime(pid)
+                if starttime is not None:
+                    _chat_scope_cache = (pid, starttime)
+                break
+            parent = _proc_ppid(pid)
+            if parent is None or parent == pid:
+                break
+            pid = parent
+        return _chat_scope_cache
+
+
+def chat_scope_id() -> str | None:
+    """Stable per-chat scope id, or None when running as a direct stdio server."""
+    scope = _chat_scope()
+    return f"{scope[0]}:{scope[1]}" if scope is not None else None
+
+
+def _chat_state_path(scope: tuple[int, int]) -> Path:
+    """Per-user, per-chat runtime state file. Non-secret; never the config file."""
+    runtime = _clean(os.environ.get("XDG_RUNTIME_DIR"))
+    if runtime is not None:
+        base = Path(runtime) / "pco-mcp"
+    else:
+        cache = _clean(os.environ.get("XDG_CACHE_HOME"))
+        base = (Path(cache) if cache is not None else Path.home() / ".cache") / "pco-mcp"
+    return base / f"chat-{scope[0]}-{scope[1]}.json"
+
+
+def _read_chat_selection(scope: tuple[int, int]) -> str | None:
+    try:
+        data = json.loads(_chat_state_path(scope).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    account = data.get("account") if isinstance(data, dict) else None
+    return _clean(account)
+
+
+def _write_chat_selection(scope: tuple[int, int], account: str | None) -> None:
+    """Atomically set or clear this chat's runtime selection.
+
+    The file holds only an account name (never credentials). A write failure
+    raises instead of pretending the chat switched accounts.
+    """
+    path = _chat_state_path(scope)
+    if account is None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise AccountError(
+                f"Could not clear this chat's PCO account selection at {path}: {exc}"
+            ) from exc
+        return
+
+    directory = path.parent
+    tmp_name: str | None = None
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            directory.chmod(0o700)
+        except OSError:
+            pass
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(directory), prefix=".chat-", suffix=".tmp"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "account": account,
+                    "scope_pid": scope[0],
+                    "scope_starttime": scope[1],
+                },
+                handle,
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+    except OSError as exc:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        raise AccountError(
+            f"Could not save this chat's PCO account selection at {path}: {exc}. "
+            "Pass account= explicitly on each call instead."
+        ) from exc
 
 
 def _env_creds() -> tuple[str, str] | None:
@@ -218,8 +367,12 @@ def _validated_default(name: str, valid: list[str], source: str) -> str:
     )
 
 
-def default_account() -> str:
-    """Resolve the default account name."""
+def default_account_with_source() -> tuple[str, str]:
+    """Resolve the default account name and where it came from (dynamic).
+
+    Sources: ``env:PCO_DEFAULT_ACCOUNT``, ``config``, ``first-key``,
+    ``env-credentials``, ``builtin``.
+    """
     file_names = list(_load_creds().keys())
     env_available = _env_creds() is not None
     valid = list(file_names)
@@ -228,17 +381,88 @@ def default_account() -> str:
 
     env_default = _clean(os.environ.get("PCO_DEFAULT_ACCOUNT"))
     if env_default is not None:
-        return _validated_default(env_default, valid, "PCO_DEFAULT_ACCOUNT")
+        name = _validated_default(env_default, valid, "PCO_DEFAULT_ACCOUNT")
+        return name, "env:PCO_DEFAULT_ACCOUNT"
 
     config_default = _config_default()
     if config_default is not None:
-        return _validated_default(config_default, valid, f"'defaultAccount' in {CONFIG_FILE}")
+        name = _validated_default(config_default, valid, f"'defaultAccount' in {CONFIG_FILE}")
+        return name, "config"
 
     if file_names:
-        return file_names[0]
+        return file_names[0], "first-key"
     if env_available:
-        return ENV_ACCOUNT_NAME
-    return DEFAULT_ACCOUNT_FALLBACK
+        return ENV_ACCOUNT_NAME, "env-credentials"
+    return DEFAULT_ACCOUNT_FALLBACK, "builtin"
+
+
+def default_account() -> str:
+    """Resolve the default account name."""
+    return default_account_with_source()[0]
+
+
+def installation_default() -> tuple[str, str]:
+    """Cached (name, source) installation default, fixed for this process.
+
+    Reads env/config on the first call only; later file or environment changes
+    do not alter the snapshot until ``reset_process_state()``.
+    """
+    global _installation_default
+    with _process_lock:
+        snapshot = _installation_default
+        if snapshot is None:
+            snapshot = default_account_with_source()
+            _installation_default = snapshot
+        return snapshot
+
+
+def selected_account() -> str | None:
+    """Account selected for this chat, or None for the installation default.
+
+    Checks this process first, then the per-chat runtime file. lazy-tool may
+    start a fresh pco child per call, so the file carries the selection between
+    those children; direct stdio has no chat file and stays in memory.
+    """
+    with _process_lock:
+        local = _selected_account
+    if local is not None:
+        return local
+    scope = _chat_scope()
+    if scope is None:
+        return None
+    return _read_chat_selection(scope)
+
+
+def select_account(account: str | None) -> str | None:
+    """Select the account for this chat.
+
+    ``None`` or a blank string clears the selection. ``"all"`` is rejected.
+    A concrete name must resolve and have usable credentials. Under lazy-tool
+    the selection is also written atomically to a small per-chat runtime file
+    (never the config or credentials file); a write failure raises so the
+    caller does not believe a switch happened when it did not.
+    """
+    global _selected_account
+    if account is None or (isinstance(account, str) and not account.strip()):
+        scope = _chat_scope()
+        if scope is not None:
+            _write_chat_selection(scope, None)
+        with _process_lock:
+            _selected_account = None
+        return None
+    name = _require_name(account)
+    if is_all(name):
+        raise AccountError(
+            f"Cannot select '{ALL}' as the chat account; pick a concrete account name."
+        )
+    resolved = resolve_accounts(name)[0]
+    credentials(resolved)
+    scope = _chat_scope()
+    if scope is not None:
+        _write_chat_selection(scope, resolved)
+    with _process_lock:
+        _selected_account = resolved
+    return resolved
 
 
 def is_all(account: str | None) -> bool:
@@ -423,6 +647,19 @@ def reset_cache() -> None:
         _creds_cache = None
 
 
+def reset_process_state() -> None:
+    """Clear chat selection, scope cache, and installation snapshot; reset caches (tests)."""
+    global _selected_account, _installation_default
+    global _chat_scope_checked, _chat_scope_cache
+    with _process_lock:
+        _selected_account = None
+        _installation_default = None
+    with _scope_lock:
+        _chat_scope_checked = False
+        _chat_scope_cache = None
+    reset_cache()
+
+
 atexit.register(close_clients)
 
 
@@ -527,15 +764,21 @@ __all__ = [
     "AccountError",
     "UnknownAccountError",
     "account_meta",
+    "chat_scope_id",
     "close_clients",
     "credentials",
     "default_account",
+    "default_account_with_source",
     "fan_out",
     "get_client",
+    "installation_default",
     "is_all",
     "list_accounts",
     "org_name",
     "reset_cache",
+    "reset_process_state",
     "resolve_accounts",
+    "select_account",
+    "selected_account",
     "set_default_account",
 ]

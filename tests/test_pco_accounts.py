@@ -10,6 +10,7 @@ import base64
 import contextlib
 import json
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,7 +20,6 @@ import httpx
 
 import pco_accounts as pa
 
-ENV_KEYS = ("PCO_APP_ID", "PCO_SECRET", "PCO_APP_SECRET", "PCO_DEFAULT_ACCOUNT")
 
 CREDS = {
     "unw": {"appId": "unw-id", "appSecret": "unw-secret", "orgName": "Main Campus"},
@@ -45,14 +45,20 @@ class AccountsTestBase(unittest.TestCase):
 
         self._env_patcher = mock.patch.dict(os.environ, {}, clear=False)
         self._env_patcher.start()
-        for key in ENV_KEYS:
+        for key in [k for k in os.environ if k.startswith("PCO_")]:
             os.environ.pop(key, None)
 
-        pa.reset_cache()
+        # Unit tests are direct stdio: never read/write a real chat runtime file.
+        scope_patcher = mock.patch.object(pa, "_chat_scope", return_value=None)
+        scope_patcher.start()
+        self._file_patches.append(scope_patcher)
+
+        pa.reset_process_state()
         self.addCleanup(self._teardown)
 
     def _teardown(self):
-        pa.reset_cache()
+        # Clears process-local selection, the installation snapshot, and caches.
+        pa.reset_process_state()
         for patcher in reversed(self._file_patches):
             patcher.stop()
         self._env_patcher.stop()
@@ -321,6 +327,219 @@ class ConfigWriteTests(AccountsTestBase):
         with self.assertRaises(pa.AccountError):
             pa.set_default_account("all")
         self.assertFalse(self.config_path.exists())
+
+
+class DefaultSourceTests(AccountsTestBase):
+    """default_account_with_source() labels each rung of the precedence ladder."""
+
+    def test_first_key_source(self):
+        self.write_creds(CREDS)
+        self.assertEqual(pa.default_account_with_source(), ("unw", "first-key"))
+        self.assertEqual(pa.default_account(), "unw")
+
+    def test_config_source(self):
+        self.write_creds(CREDS)
+        self.write_config({"defaultAccount": "rs"})
+        self.assertEqual(pa.default_account_with_source(), ("rs", "config"))
+
+    def test_env_source(self):
+        self.write_creds(CREDS)
+        self.write_config({"defaultAccount": "unw"})
+        os.environ["PCO_DEFAULT_ACCOUNT"] = "rs"
+        self.assertEqual(
+            pa.default_account_with_source(), ("rs", "env:PCO_DEFAULT_ACCOUNT")
+        )
+
+    def test_env_credentials_source(self):
+        os.environ["PCO_APP_ID"] = "env-id"
+        os.environ["PCO_SECRET"] = "env-secret"
+        self.assertEqual(
+            pa.default_account_with_source(), ("env", "env-credentials")
+        )
+
+    def test_builtin_source(self):
+        self.assertEqual(pa.list_accounts(), [])
+        self.assertEqual(pa.default_account_with_source(), ("unw", "builtin"))
+
+    def test_invalid_env_default_still_raises(self):
+        self.write_creds(CREDS)
+        os.environ["PCO_DEFAULT_ACCOUNT"] = "bogus"
+        with self.assertRaises(pa.AccountError) as ctx:
+            pa.default_account_with_source()
+        self.assertIn("bogus", str(ctx.exception))
+
+
+class InstallationSnapshotTests(AccountsTestBase):
+    def test_snapshot_is_cached_until_reset(self):
+        self.write_creds(CREDS)
+        self.write_config({"defaultAccount": "unw"})
+        self.assertEqual(pa.installation_default(), ("unw", "config"))
+
+        # A later config change must not move this process's installation default.
+        self.write_config({"defaultAccount": "rs"})
+        self.assertEqual(pa.installation_default(), ("unw", "config"))
+        # Dynamic resolution (a new process would see this) does follow the file.
+        self.assertEqual(pa.default_account(), "rs")
+
+        pa.reset_process_state()
+        self.assertEqual(pa.installation_default(), ("rs", "config"))
+
+    def test_snapshot_ignores_later_env_change(self):
+        self.write_creds(CREDS)
+        self.assertEqual(pa.installation_default(), ("unw", "first-key"))
+
+        os.environ["PCO_DEFAULT_ACCOUNT"] = "rs"
+        self.assertEqual(pa.installation_default(), ("unw", "first-key"))
+        self.assertEqual(pa.default_account(), "rs")
+
+    def test_snapshot_ignores_later_creds_change(self):
+        self.write_creds({"unw": CREDS["unw"]})
+        self.assertEqual(pa.installation_default(), ("unw", "first-key"))
+
+        # Add an account that would sort first: the snapshot is already taken.
+        self.write_creds({"aaa": {"appId": "a", "appSecret": "b"}, "unw": CREDS["unw"]})
+        self.assertEqual(pa.installation_default(), ("unw", "first-key"))
+        pa.reset_process_state()
+        self.assertEqual(pa.installation_default(), ("aaa", "first-key"))
+
+
+class SelectionTests(AccountsTestBase):
+    def setUp(self):
+        super().setUp()
+        self.write_creds(CREDS)
+
+    def test_select_stores_without_changing_installation_default(self):
+        self.assertIsNone(pa.selected_account())
+        self.assertEqual(pa.select_account("rs"), "rs")
+        self.assertEqual(pa.selected_account(), "rs")
+        self.assertEqual(pa.default_account(), "unw")
+        self.assertEqual(pa.select_account("unw"), "unw")
+        self.assertEqual(pa.selected_account(), "unw")
+
+    def test_repeat_selection_is_stable(self):
+        pa.select_account("rs")
+        self.assertEqual(pa.select_account("rs"), "rs")
+        self.assertEqual(pa.selected_account(), "rs")
+
+    def test_none_and_blank_clear_selection(self):
+        for clear_value in (None, "", "   "):
+            pa.select_account("rs")
+            self.assertIsNone(pa.select_account(clear_value))
+            self.assertIsNone(pa.selected_account())
+
+    def test_all_is_rejected(self):
+        with self.assertRaises(pa.AccountError):
+            pa.select_account("all")
+        self.assertIsNone(pa.selected_account())
+
+    def test_unknown_account_rejected_with_valid_names(self):
+        with self.assertRaises(pa.AccountError) as ctx:
+            pa.select_account("bogus")
+        message = str(ctx.exception)
+        self.assertIn("bogus", message)
+        self.assertIn("unw", message)
+        self.assertIn("rs", message)
+        self.assertIsNone(pa.selected_account())
+
+    def test_account_without_usable_credentials_is_rejected(self):
+        self.write_creds({"broken": {"appId": "only-id"}})
+        with self.assertRaises(pa.AccountError):
+            pa.select_account("broken")
+        self.assertIsNone(pa.selected_account())
+
+    def test_selection_validation_reads_the_current_file(self):
+        self.assertEqual(pa.select_account("rs"), "rs")
+        self.write_creds({"unw": CREDS["unw"]})
+        with self.assertRaises(pa.AccountError):
+            pa.select_account("rs")
+
+    def test_legacy_env_only_selection_allows_any_name(self):
+        self.creds_path.unlink()
+        os.environ["PCO_APP_ID"] = "env-id"
+        os.environ["PCO_SECRET"] = "env-secret"
+        self.assertEqual(pa.select_account("unw"), "unw")
+        self.assertEqual(pa.selected_account(), "unw")
+
+    def test_reset_process_state_clears_selection_and_snapshot(self):
+        pa.select_account("rs")
+        self.assertEqual(pa.installation_default(), ("unw", "first-key"))
+
+        pa.reset_process_state()
+
+        self.assertIsNone(pa.selected_account())
+        self.write_config({"defaultAccount": "rs"})
+        self.assertEqual(pa.installation_default(), ("rs", "config"))
+
+
+class ChatStateFileTests(AccountsTestBase):
+    """The per-chat runtime file that survives lazy-tool's per-call pco children."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_creds(CREDS)
+        self.state_root = Path(self._tmp.name) / "runtime"
+        self.state_root.mkdir()
+        self._xdg = mock.patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": str(self.state_root)}, clear=False
+        )
+        self._xdg.start()
+        self.addCleanup(self._xdg.stop)
+        self._scope = mock.patch.object(
+            pa, "_chat_scope", return_value=(4242, 777)
+        )
+        self._scope.start()
+        self.addCleanup(self._scope.stop)
+        self.state_path = self.state_root / "pco-mcp" / "chat-4242-777.json"
+
+    def reset_in_memory_selection(self):
+        with pa._process_lock:
+            pa._selected_account = None
+
+    def test_selection_survives_a_new_process_with_secure_permissions(self):
+        self.assertEqual(pa.chat_scope_id(), "4242:777")
+        self.assertEqual(pa.select_account("rs"), "rs")
+
+        self.assertTrue(self.state_path.is_file())
+        self.assertEqual(stat.S_IMODE(self.state_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.state_path.parent.stat().st_mode), 0o700)
+        payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["account"], "rs")
+        self.assertEqual(payload["scope_pid"], 4242)
+        self.assertEqual(payload["scope_starttime"], 777)
+
+        # Simulate the next lazy-tool call: a brand-new pco process.
+        self.reset_in_memory_selection()
+        self.assertEqual(pa.selected_account(), "rs")
+
+        pa.select_account(None)
+        self.assertFalse(self.state_path.exists())
+        self.assertIsNone(pa.selected_account())
+
+    def test_scopes_are_isolated(self):
+        pa.select_account("unw")
+
+        with mock.patch.object(pa, "_chat_scope", return_value=(4243, 888)):
+            self.reset_in_memory_selection()
+            self.assertIsNone(pa.selected_account())
+            self.assertEqual(pa.select_account("rs"), "rs")
+            self.reset_in_memory_selection()
+            self.assertEqual(pa.selected_account(), "rs")
+
+        self.reset_in_memory_selection()
+        self.assertEqual(pa.selected_account(), "unw")
+        self.assertTrue((self.state_root / "pco-mcp" / "chat-4243-888.json").is_file())
+
+    def test_malformed_state_file_is_ignored(self):
+        self.state_path.parent.mkdir(parents=True)
+        self.state_path.write_text("{not json", encoding="utf-8")
+        self.reset_in_memory_selection()
+        self.assertIsNone(pa.selected_account())
+
+    def test_direct_stdio_writes_no_chat_file(self):
+        with mock.patch.object(pa, "_chat_scope", return_value=None):
+            self.assertEqual(pa.select_account("rs"), "rs")
+            self.assertEqual(pa.selected_account(), "rs")
+        self.assertFalse((self.state_root / "pco-mcp").exists())
 
 
 if __name__ == "__main__":
